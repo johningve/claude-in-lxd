@@ -1,0 +1,34 @@
+#!/bin/bash
+# Fired by Claude Code Notification hook — agent needs user attention
+set -e
+
+: "${CLXD_STATUS_DIR:=/opt/clxd-status}"
+: "${CLXD_SLUG:=unknown}"
+: "${CLXD_WORKTREE:=unknown}"
+
+mkdir -p "$CLXD_STATUS_DIR"
+
+# Read notification JSON from stdin; extract message if present
+input=$(cat)
+message=$(echo "$input" | jq -r '.message // .title // ""' 2>/dev/null || true)
+
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+tmp="$CLXD_STATUS_DIR/status.json.tmp"
+
+# Escape message for JSON
+message_escaped=$(printf '%s' "$message" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | tr -d '\n')
+
+cat > "$tmp" <<EOF
+{
+  "slug": "$CLXD_SLUG",
+  "worktree": "$CLXD_WORKTREE",
+  "state": "waiting",
+  "message": "$message_escaped",
+  "updated_at": "$ts"
+}
+EOF
+
+mv "$tmp" "$CLXD_STATUS_DIR/status.json"
+
+echo "{\"slug\":\"$CLXD_SLUG\",\"state\":\"waiting\",\"message\":\"$message_escaped\",\"ts\":\"$ts\"}" \
+  >> "$CLXD_STATUS_DIR/events.jsonl"

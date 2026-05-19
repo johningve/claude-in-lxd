@@ -1,0 +1,1026 @@
+#!/usr/bin/env fish
+# clxd — LXD-based isolated Claude Code agent runner
+#
+# Subcommands:
+#   clxd [launch] [path]          Launch agent in worktree's container (default)
+#   clxd shell    [path]          Open a bash shell in the container
+#   clxd exec     [path] -- cmd   Run a command inside the container
+#   clxd status   [--json]        One-shot status table of all sessions
+#   clxd dash                     Looping dashboard (runs in byobu status window)
+#   clxd attach   [path|slug]     Attach to a session's byobu window
+#   clxd ls                       Machine-readable container list
+#   clxd stop     [path]          Stop container (keep volumes)
+#   clxd destroy  [path]          Stop + delete container
+#   clxd gc       [--dry-run]     Remove containers whose worktree is gone
+#   clxd build-image [profile] [--from dir]  Build (or rebuild) an image
+#   clxd list-images              List local claude-in-lxd* images
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+set -g CLXD_TMUX_SESSION clxd
+set -g CLXD_STATUS_HOST_DIR $HOME/.cache/clxd/status
+set -g CLXD_CONTAINER_STATUS_DIR /opt/clxd-status
+set -g CLXD_IMAGE_DEFAULT claude-in-lxd
+set -g CLXD_CONTAINER_CLAUDE_DIR /home/agent/.claude
+# Permission mode for claude inside the container. Valid values:
+#   bypassPermissions  — fully automated (recommended for isolated containers)
+#   acceptEdits        — auto-approve file edits, prompt for shell commands
+#   default            — normal interactive mode
+set -g CLXD_PERMISSION_MODE auto
+
+# Resolve the repo root from the location of this script
+set -g _CLXD_BIN (realpath (status --current-filename))
+set -g _CLXD_ROOT (dirname (dirname $_CLXD_BIN))
+
+# Resolve host Claude config dir (honor CLAUDE_CONFIG_DIR)
+if test -n "$CLAUDE_CONFIG_DIR"
+    set -g _HOST_CLAUDE_DIR $CLAUDE_CONFIG_DIR
+else
+    set -g _HOST_CLAUDE_DIR $HOME/.claude
+end
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+
+function main
+    if test (count $argv) -eq 0
+        _clxd_launch $PWD
+        return
+    end
+
+    switch $argv[1]
+        case launch
+            _clxd_launch $argv[2..]
+        case shell
+            _clxd_shell $argv[2..]
+        case exec
+            _clxd_exec $argv[2..]
+        case status
+            _clxd_status $argv[2..]
+        case dash
+            _clxd_dash
+        case _dash-ls
+            _clxd_dash_ls
+        case _dash-preview
+            _clxd_dash_preview $argv[2..]
+        case attach
+            _clxd_attach $argv[2..]
+        case ls
+            _clxd_ls
+        case stop
+            _clxd_stop $argv[2..]
+        case destroy
+            _clxd_destroy $argv[2..]
+        case gc
+            _clxd_gc $argv[2..]
+        case build-image
+            _clxd_build_image $argv[2..]
+        case list-images
+            _clxd_list_images
+        case help --help -h
+            _clxd_help
+        case '*'
+            # If the first arg looks like a path and no subcommand, treat as launch
+            if test -d $argv[1]
+                _clxd_launch $argv
+            else
+                echo "Unknown command: $argv[1]" >&2
+                _clxd_help
+                exit 1
+            end
+    end
+end
+
+# ── Worktree helpers ──────────────────────────────────────────────────────────
+
+function _clxd_worktree_info
+    # Resolves worktree metadata from a path.
+    # Sets caller-visible vars: _wt_path, _wt_main, _wt_repo, _wt_branch
+    set path (realpath $argv[1] 2>/dev/null)
+    if test -z "$path" -o ! -d "$path"
+        echo "Error: path does not exist: $argv[1]" >&2
+        return 1
+    end
+
+    # Find the toplevel of the worktree
+    set toplevel (git -C $path rev-parse --show-toplevel 2>/dev/null)
+    if test -z "$toplevel"
+        echo "Error: not inside a git repository: $path" >&2
+        return 1
+    end
+    set -g _wt_path $toplevel
+
+    # Find the absolute git dir and derive the main worktree from it
+    set abs_git_dir (git -C $path rev-parse --absolute-git-dir 2>/dev/null)
+    if string match -qr '\.git/worktrees/' -- $abs_git_dir
+        # Linked worktree: strip /worktrees/<name> suffix to get to .git dir
+        set main_git (string replace -r '/worktrees/[^/]+/?$' '' $abs_git_dir)
+    else
+        set main_git $abs_git_dir
+    end
+    set -g _wt_main (dirname $main_git)
+
+    set -g _wt_branch (basename $_wt_path)
+    set -g _wt_repo (basename (dirname $_wt_path))
+end
+
+function _clxd_slug
+    # Derives a valid LXD container name from a worktree path
+    set worktree $argv[1]
+    set branch_name (basename $worktree)
+    set repo_name (basename (dirname $worktree))
+
+    set raw "$repo_name-$branch_name"
+    # Lowercase, replace non-alnum with dash, collapse runs, strip leading/trailing dashes
+    set slug (echo $raw \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed 's/[^a-z0-9]/-/g; s/-\+/-/g; s/^-//; s/-$//')
+
+    # LXD max name length is 63. Reserve room for prefix + hash suffix.
+    if test (string length $slug) -gt 50
+        set short (string sub -l 50 $slug)
+        set hash (echo -n $worktree | sha1sum | cut -c1-8)
+        set slug "$short-$hash"
+    end
+
+    echo "clxd-$slug"
+end
+
+function _clxd_resolve_image
+    # Resolve image alias for a worktree. Priority:
+    #   1. $argv[1] if non-empty (from --image flag)
+    #   2. .clxd-image in worktree root
+    #   3. .clxd-image in main worktree root
+    #   4. CLXD_IMAGE_DEFAULT
+    set override $argv[1]
+    set worktree $argv[2]
+    set main_worktree $argv[3]
+
+    if test -n "$override"
+        echo $override
+        return
+    end
+
+    for candidate in $worktree/.clxd-image $main_worktree/.clxd-image
+        if test -f $candidate
+            string trim < $candidate
+            return
+        end
+    end
+
+    echo $CLXD_IMAGE_DEFAULT
+end
+
+# ── Container lifecycle ───────────────────────────────────────────────────────
+
+function _clxd_create_container
+    set name $argv[1]
+    set image $argv[2]
+    set worktree $argv[3]
+    set main_worktree $argv[4]
+
+    set slug (string replace 'clxd-' '' $name)
+
+    echo "Creating container $name from image '$image'..."
+    lxc init $image $name --profile default --profile claude-in-lxd
+
+    # Store metadata for gc and status
+    lxc config set $name user.workspace.host-path=$worktree
+    lxc config set $name user.workspace.slug=$slug
+
+    # Same-path bind mount of the worktree (rw)
+    lxc config device add $name workspace disk source=$worktree path=$worktree
+
+    # Read-only mount of main worktree (so gwt's absolute symlinks resolve)
+    if test "$main_worktree" != "$worktree"
+        lxc config device add $name mainworktree disk \
+            source=$main_worktree path=$main_worktree readonly=true
+    end
+
+    # Per-container status dir on host (bind-mounted into container)
+    mkdir -p $CLXD_STATUS_HOST_DIR/$name
+    lxc config device add $name clxd-status disk \
+        source=$CLXD_STATUS_HOST_DIR/$name path=$CLXD_CONTAINER_STATUS_DIR
+
+    # Environment variables available to all processes in the container
+    lxc config set $name environment.CLXD_SLUG=$slug
+    lxc config set $name environment.CLXD_WORKTREE=$worktree
+    lxc config set $name environment.CLXD_STATUS_DIR=$CLXD_CONTAINER_STATUS_DIR
+    lxc config set $name environment.CLAUDE_CONFIG_DIR=$CLXD_CONTAINER_CLAUDE_DIR
+end
+
+function _clxd_wait_for_boot
+    set name $argv[1]
+    echo "Waiting for container to boot..."
+    for i in (seq 1 30)
+        if lxc exec $name -- test -S /run/dbus/system_bus_socket 2>/dev/null
+            return
+        end
+        sleep 1
+    end
+    echo "Warning: D-Bus socket did not appear in 30s" >&2
+end
+
+function _clxd_first_boot_setup
+    set name $argv[1]
+
+    lxc exec $name -- bash -c '
+        set -e
+        # Ensure ~/.claude exists and is owned by agent
+        mkdir -p /home/agent/.claude
+        chown 1000:1000 /home/agent/.claude
+
+        # Seed settings.json with hook config if not yet present
+        if [ ! -f /home/agent/.claude/settings.json ] && [ -f /opt/clxd/claude-settings.json ]; then
+            cp /opt/clxd/claude-settings.json /home/agent/.claude/settings.json
+            chown 1000:1000 /home/agent/.claude/settings.json
+        fi
+
+        touch /var/lib/clxd-initialized
+    '
+end
+
+function _clxd_push_credentials
+    set name $argv[1]
+
+    # Ensure target dir exists in container
+    lxc exec $name -- bash -c \
+        "mkdir -p $CLXD_CONTAINER_CLAUDE_DIR && chown 1000:1000 $CLXD_CONTAINER_CLAUDE_DIR"
+
+    set pushed false
+
+    # Push .credentials.json
+    set creds_src $_HOST_CLAUDE_DIR/.credentials.json
+    if test -f $creds_src
+        lxc file push $creds_src \
+            $name/home/agent/.claude/.credentials.json \
+            --uid 1000 --gid 1000 --mode 600
+        set pushed true
+    end
+
+    # Push .claude.json (inside config dir for this user's layout)
+    set account_src $_HOST_CLAUDE_DIR/.claude.json
+    if test -f $account_src
+        lxc file push $account_src \
+            $name/home/agent/.claude/.claude.json \
+            --uid 1000 --gid 1000 --mode 600
+        set pushed true
+    else if test -f $HOME/.claude.json
+        # Legacy: .claude.json at home root rather than inside config dir
+        lxc file push $HOME/.claude.json \
+            $name/home/agent/.claude/.claude.json \
+            --uid 1000 --gid 1000 --mode 600
+        set pushed true
+    end
+
+    if not $pushed
+        # Try env var fallbacks
+        if test -n "$ANTHROPIC_API_KEY"
+            lxc config set $name environment.ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
+        else
+            echo "Warning: No Claude credentials found on host." >&2
+            echo "  Log in on host first, or set ANTHROPIC_API_KEY." >&2
+            echo "  You can also run 'claude' inside the container to log in interactively." >&2
+        end
+    end
+end
+
+function _clxd_wait_for_docker
+    set name $argv[1]
+    echo "Waiting for Docker..."
+    for i in (seq 1 30)
+        if lxc exec $name -- docker info > /dev/null 2>&1
+            return
+        end
+        sleep 1
+    end
+    echo "Warning: Docker did not become ready in 30s" >&2
+end
+
+# ── tmux / byobu helpers ──────────────────────────────────────────────────────
+
+function _clxd_ensure_tmux_session
+    if not tmux has-session -t $CLXD_TMUX_SESSION 2>/dev/null
+        # Create session with a pinned 'dash' window showing the status dashboard.
+        # Use absolute path so tmux's non-interactive shell finds clxd regardless of PATH.
+        tmux new-session -d -s $CLXD_TMUX_SESSION -n dash "$_CLXD_BIN dash"
+        tmux set-option -t $CLXD_TMUX_SESSION:dash remain-on-exit on
+        tmux set-hook -t $CLXD_TMUX_SESSION \
+            'after-select-window' \
+            "if-shell \"[ #\{window_name\} = dash ]\" \"respawn-window -k\""
+    else
+        # Ensure the dash window still exists
+        if not tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_name}' 2>/dev/null \
+                | grep -qx dash
+            tmux new-window -t $CLXD_TMUX_SESSION: -n dash "$_CLXD_BIN dash"
+            tmux set-option -t $CLXD_TMUX_SESSION:dash remain-on-exit on
+        end
+    end
+end
+
+function _clxd_ensure_agent_window
+    set slug $argv[1]
+    set exec_cmd $argv[2]
+
+    if not tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_name}' 2>/dev/null \
+            | grep -qx $slug
+        tmux new-window -t $CLXD_TMUX_SESSION: -n $slug $exec_cmd
+        # Byobu enables automatic-rename globally; lock the name to the slug
+        tmux set-window-option -t "$CLXD_TMUX_SESSION:{end}" allow-rename off
+    end
+end
+
+function _clxd_attach_to_slug
+    set slug $argv[1]
+    if set -q TMUX
+        echo "Already inside tmux. To switch to this session:"
+        echo "  tmux switch-client -t $CLXD_TMUX_SESSION"
+        echo "  tmux select-window -t '$CLXD_TMUX_SESSION:$slug'"
+    else
+        byobu attach-session -t $CLXD_TMUX_SESSION \; select-window -t $slug
+    end
+end
+
+# ── Write initial status ──────────────────────────────────────────────────────
+
+function _clxd_write_initial_status
+    set name $argv[1]
+    set slug $argv[2]
+    set worktree $argv[3]
+
+    set status_dir $CLXD_STATUS_HOST_DIR/$name
+    mkdir -p $status_dir
+
+    set ts (date -u +%Y-%m-%dT%H:%M:%SZ)
+    set tmp $status_dir/status.json.tmp
+    echo '{
+  "slug": "'"$slug"'",
+  "worktree": "'"$worktree"'",
+  "state": "started",
+  "message": "",
+  "updated_at": "'"$ts"'"
+}' > $tmp
+    mv $tmp $status_dir/status.json
+end
+
+# ── Subcommands ───────────────────────────────────────────────────────────────
+
+function _clxd_launch
+    # Parse: [--image <img>] [path]
+    set image ""
+    set path $PWD
+
+    set i 1
+    while test $i -le (count $argv)
+        switch $argv[$i]
+            case --image
+                set i (math $i + 1)
+                set image $argv[$i]
+            case '*'
+                set path $argv[$i]
+        end
+        set i (math $i + 1)
+    end
+
+    if not _clxd_worktree_info $path
+        exit 1
+    end
+
+    set image (_clxd_resolve_image "$image" $_wt_path $_wt_main)
+    set name (_clxd_slug $_wt_path)
+    set slug (string replace 'clxd-' '' $name)
+
+    # Create container if it doesn't exist
+    if not lxc info $name > /dev/null 2>&1
+        _clxd_create_container $name $image $_wt_path $_wt_main
+        if not lxc start $name
+            echo "Error: failed to start container $name" >&2
+            echo "Run: lxc info --show-log $name" >&2
+            return 1
+        end
+        _clxd_wait_for_boot $name
+        _clxd_first_boot_setup $name
+    else
+        # Start if stopped
+        set state (lxc info $name 2>/dev/null | awk '/^Status:/ {print tolower($2)}')
+        if test "$state" != running
+            echo "Starting container $name..."
+            if not lxc start $name
+                echo "Error: failed to start container $name" >&2
+                echo "Run: lxc info --show-log $name" >&2
+                return 1
+            end
+            _clxd_wait_for_boot $name
+        end
+    end
+
+    # Push credentials on every launch (keeps tokens fresh)
+    _clxd_push_credentials $name
+
+    # Wait for Docker
+    _clxd_wait_for_docker $name
+
+    # Write initial status
+    _clxd_write_initial_status $name $slug $_wt_path
+
+    # Ensure tmux session + dash window
+    _clxd_ensure_tmux_session
+
+    # su without -l: preserves container env (CLAUDE_CONFIG_DIR etc.) and avoids setsid
+    set exec_cmd "lxc exec $name --cwd $_wt_path -- su agent -c 'claude --permission-mode $CLXD_PERMISSION_MODE'"
+
+    # Ensure per-slug agent window in tmux
+    _clxd_ensure_agent_window $slug $exec_cmd
+
+    echo "Agent launched: $name"
+    echo "  worktree: $_wt_path"
+    echo "  image:    $image"
+
+    _clxd_attach_to_slug $slug
+end
+
+function _clxd_shell
+    set path $PWD
+    if test (count $argv) -gt 0
+        set path $argv[1]
+    end
+
+    if not _clxd_worktree_info $path
+        exit 1
+    end
+
+    set name (_clxd_slug $_wt_path)
+
+    if not lxc info $name > /dev/null 2>&1
+        echo "No container for this worktree. Run 'clxd launch' first." >&2
+        exit 1
+    end
+
+    set state (lxc info $name 2>/dev/null | awk '/^Status:/ {print tolower($2)}')
+    if test "$state" != running
+        lxc start $name
+        _clxd_wait_for_boot $name
+    end
+
+    # su without -l: no setsid, so bash stays in lxc exec's PTY session (job control works)
+    lxc exec $name --cwd $_wt_path -- su agent
+end
+
+function _clxd_exec
+    # clxd exec [path] -- cmd [args...]
+    set path $PWD
+    set cmd_args
+
+    # Find the -- separator
+    set sep_idx 0
+    for i in (seq 1 (count $argv))
+        if test "$argv[$i]" = "--"
+            set sep_idx $i
+            break
+        end
+    end
+
+    if test $sep_idx -eq 0
+        echo "Usage: clxd exec [path] -- <command> [args...]" >&2
+        exit 1
+    end
+
+    if test $sep_idx -gt 1
+        set path $argv[1]
+    end
+    set cmd_args $argv[(math $sep_idx + 1)..]
+
+    if not _clxd_worktree_info $path
+        exit 1
+    end
+
+    set name (_clxd_slug $_wt_path)
+
+    if not lxc info $name > /dev/null 2>&1
+        echo "No container for this worktree. Run 'clxd launch' first." >&2
+        exit 1
+    end
+
+    set state (lxc info $name 2>/dev/null | awk '/^Status:/ {print tolower($2)}')
+    if test "$state" != running
+        lxc start $name
+        _clxd_wait_for_boot $name
+    end
+
+    set cmd_str (string join " " $cmd_args)
+    lxc exec $name -- su - agent -c "cd $_wt_path && $cmd_str"
+end
+
+function _clxd_status
+    set json_mode false
+    set color_mode (test -t 1; and echo always; or echo never)
+
+    for arg in $argv
+        switch $arg
+            case --json
+                set json_mode true
+            case --color
+                set color_mode always
+            case --no-color
+                set color_mode never
+        end
+    end
+
+    # Gather all clxd containers
+    set containers (lxc list --format csv -c n 2>/dev/null | grep '^clxd-'; or true)
+
+    if test -z "$containers"
+        if not $json_mode
+            echo "No clxd containers."
+        end
+        return
+    end
+
+    if not $json_mode
+        printf "%-46s  %-9s  %-9s  %-45s  %s\n" \
+            SLUG STATE CONTAINER WORKTREE UPDATED
+        printf "%-46s  %-9s  %-9s  %-45s  %s\n" \
+            (string repeat -n 46 -) (string repeat -n 9 -) (string repeat -n 9 -) \
+            (string repeat -n 45 -) -------
+    end
+
+    for name in (string split \n $containers)
+        test -z "$name"; and continue
+
+        set worktree (lxc config get $name user.workspace.host-path 2>/dev/null)
+        set slug (lxc config get $name user.workspace.slug 2>/dev/null)
+        set container_state (lxc info $name 2>/dev/null \
+            | awk '/^Status:/ {print tolower($2)}')
+
+        set agent_state unknown
+        set updated_at --
+        set message ""
+
+        set status_file $CLXD_STATUS_HOST_DIR/$name/status.json
+        if test -f $status_file
+            set agent_state (jq -r '.state // "unknown"' $status_file 2>/dev/null; or echo unknown)
+            set updated_at (jq -r '.updated_at // "--"' $status_file 2>/dev/null; or echo --)
+            set message (jq -r '.message // ""' $status_file 2>/dev/null; or true)
+
+            # Make timestamp human-readable (relative)
+            if test "$updated_at" != "--"
+                set epoch_then (date -d $updated_at +%s 2>/dev/null; or echo 0)
+                set epoch_now (date +%s)
+                set diff (math $epoch_now - $epoch_then)
+                if test $diff -lt 60
+                    set updated_at "$diff""s ago"
+                else if test $diff -lt 3600
+                    set updated_at (math --scale=0 $diff / 60)"m ago"
+                else
+                    set updated_at (math --scale=0 $diff / 3600)"h ago"
+                end
+            end
+        end
+
+        if $json_mode
+            echo '{"slug":"'"$slug"'","container":"'"$name"'","container_state":"'"$container_state"'","agent_state":"'"$agent_state"'","worktree":"'"$worktree"'","updated_at":"'"$updated_at"'"}'
+        else
+            # Color the state column
+            set state_colored $agent_state
+            if test "$color_mode" = always
+                switch $agent_state
+                    case working
+                        set state_colored (printf "\e[36m%s\e[0m" $agent_state)
+                    case waiting
+                        set state_colored (printf "\e[33m%s\e[0m" $agent_state)
+                    case idle
+                        set state_colored (printf "\e[32m%s\e[0m" $agent_state)
+                    case stopped unknown
+                        set state_colored (printf "\e[2m%s\e[0m" $agent_state)
+                end
+            end
+
+            set display_wt (string replace $HOME '~' $worktree)
+            set display_slug $slug
+            if test (string length $display_slug) -gt 44
+                set display_slug (string sub -l 44 $display_slug)..
+            end
+            if test (string length $display_wt) -gt 43
+                set display_wt ..(string sub -s (math (string length $display_wt) - 41) $display_wt)
+            end
+
+            printf "%-46s  %-9s  %-9s  %-45s  %s\n" \
+                $display_slug $state_colored $container_state $display_wt $updated_at
+        end
+    end
+
+    if not $json_mode
+        echo ""
+        echo "Attach: byobu attach-session -t $CLXD_TMUX_SESSION"
+        echo "Switch: Ctrl+a w"
+    end
+end
+
+function _clxd_dash
+    if not command -q fzf
+        echo "Note: install fzf for interactive mode (apt install fzf). Falling back to static display."
+        while true
+            clear
+            _clxd_status --color
+            sleep 2
+        end
+        return
+    end
+
+    while true
+        set port 16266
+
+        # Background process: every 2s, GET current cursor position then POST reload+pos to
+        # refresh the list without moving the selection. Uses fzf --listen HTTP API.
+        fish -c "
+            while sleep 2
+                set resp (curl -s 'http://127.0.0.1:$port' 2>/dev/null)
+                test -z \"\$resp\"; and continue
+                set pos (printf '%s' \"\$resp\" | jq -r '.position // 0' 2>/dev/null; or echo 0)
+                set pos1 (math \$pos + 1)
+                curl -s -X POST 'http://127.0.0.1:$port' \
+                    --data \"reload-sync($_CLXD_BIN _dash-ls)+pos(\$pos1)\" >/dev/null 2>&1
+            end
+        " &
+        set bg_pid $last_pid
+
+        # Field 1 (before tab) = slug; field 2+ = display. --with-nth 2 hides field 1.
+        set selected ($_CLXD_BIN _dash-ls | fzf \
+            --ansi \
+            --listen $port \
+            --delimiter "\t" \
+            --with-nth 2 \
+            --layout=reverse \
+            --height 100% \
+            --no-info \
+            --header 'Enter=jump/relaunch  r=refresh  q=quit' \
+            --preview "$_CLXD_BIN _dash-preview {1}" \
+            --preview-window 'down,30%,wrap' \
+            --bind 'q:abort' \
+            --bind "r:reload($_CLXD_BIN _dash-ls)")
+
+        kill $bg_pid 2>/dev/null
+
+        if test (count $selected) -eq 0
+            break
+        end
+
+        set slug (echo $selected[1] | awk -F'\t' '{print $1}')
+        if test -z "$slug"
+            continue
+        end
+
+        if tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_name}' 2>/dev/null \
+                | grep -qx $slug
+            # Live window: jump to it
+            tmux select-window -t "$CLXD_TMUX_SESSION:$slug" 2>/dev/null
+        else
+            # Dead session: spin up a new window for the same container
+            set _name "clxd-$slug"
+            set _wt (lxc config get $_name user.workspace.host-path 2>/dev/null)
+            if test -n "$_wt"
+                set _cmd "lxc exec $_name --cwd $_wt -- su agent -c 'claude --permission-mode $CLXD_PERMISSION_MODE'"
+                tmux new-window -t $CLXD_TMUX_SESSION: -n $slug $_cmd
+                tmux select-window -t "$CLXD_TMUX_SESSION:$slug" 2>/dev/null
+            end
+        end
+        # Loop: relaunch picker so returning to dash window shows fresh list
+    end
+end
+
+function _clxd_dash_ls
+    # One lxc call fetches name + config for all containers at once (avoids per-container API calls)
+    set container_rows (lxc list --format json 2>/dev/null | jq -r '
+        .[] | select(.name | startswith("clxd-")) |
+        [.name,
+         (.config["user.workspace.slug"] // ""),
+         (.config["user.workspace.host-path"] // "")] | @tsv
+    ' 2>/dev/null)
+
+    if test -z "$container_rows"
+        printf "\t(no sessions — run clxd launch in a worktree)\n"
+        return
+    end
+
+    # Active tmux window slugs for dead-session detection
+    set active_windows (tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_name}' 2>/dev/null)
+
+    for row in (string split \n $container_rows)
+        test -z "$row"; and continue
+
+        set name    (printf '%s' $row | cut -f1)
+        set slug    (printf '%s' $row | cut -f2)
+        set worktree (printf '%s' $row | cut -f3)
+
+        set agent_state unknown
+        set updated_at --
+
+        set status_file $CLXD_STATUS_HOST_DIR/$name/status.json
+        if test -f $status_file
+            set agent_state (jq -r '.state // "unknown"' $status_file 2>/dev/null; or echo unknown)
+            set updated_at (jq -r '.updated_at // "--"' $status_file 2>/dev/null; or echo --)
+
+            if test "$updated_at" != "--"
+                set epoch_then (date -d $updated_at +%s 2>/dev/null; or echo 0)
+                set epoch_now (date +%s)
+                set diff (math $epoch_now - $epoch_then)
+                if test $diff -lt 60
+                    set updated_at "$diff""s"
+                else if test $diff -lt 3600
+                    set updated_at (math --scale=0 $diff / 60)"m"
+                else
+                    set updated_at (math --scale=0 $diff / 3600)"h"
+                end
+            end
+        end
+
+        # Override state to "dead" if no active tmux window for this slug
+        if not contains $slug $active_windows
+            set agent_state dead
+        end
+
+        # Color state; compute pad from visual length (not byte length of colored string)
+        switch $agent_state
+            case working
+                set state_colored (printf "\e[36m%s\e[0m" $agent_state)
+            case waiting
+                set state_colored (printf "\e[33m%s\e[0m" $agent_state)
+            case idle
+                set state_colored (printf "\e[32m%s\e[0m" $agent_state)
+            case dead
+                set state_colored (printf "\e[31m%s\e[0m" $agent_state)
+            case '*'
+                set state_colored (printf "\e[2m%s\e[0m" $agent_state)
+        end
+        set pad (string repeat -n (math 9 - (string length $agent_state)) " ")
+
+        set display_wt (string replace $HOME '~' $worktree)
+        if test (string length $display_wt) -gt 55
+            # Keep prefix and full last component (branch name): prefix…/branch
+            set _basename (string split '/' $display_wt)[-1]
+            set _pfx_len (math 53 - (string length $_basename))
+            if test $_pfx_len -ge 3
+                set display_wt (string sub -l $_pfx_len $display_wt)…/$_basename
+            else
+                set display_wt ..(string sub -s (math (string length $display_wt) - 52) $display_wt)
+            end
+        end
+
+        # Tab-separated: field 1 = slug (hidden by --with-nth 2), field 2 = display line
+        printf "%s\t%-57s  %s%s  %s\n" \
+            $slug $display_wt $state_colored $pad $updated_at
+    end
+end
+
+function _clxd_dash_preview
+    set slug $argv[1]
+    if test -z "$slug"
+        echo "No session selected."
+        return
+    end
+
+    # Placeholder row from empty list: skip quietly
+    if string match -q '' $slug; or string match -q '(*' $slug
+        return
+    end
+
+    set name "clxd-$slug"
+    set worktree (lxc config get $name user.workspace.host-path 2>/dev/null)
+    set container_state (lxc info $name 2>/dev/null | awk '/^Status:/ {print tolower($2)}')
+
+    set agent_state unknown
+    set updated_at --
+    set message ""
+
+    set status_file $CLXD_STATUS_HOST_DIR/$name/status.json
+    if test -f $status_file
+        set agent_state (jq -r '.state // "unknown"' $status_file 2>/dev/null; or echo unknown)
+        set updated_at (jq -r '.updated_at // "--"' $status_file 2>/dev/null; or echo --)
+        set message (jq -r '.message // ""' $status_file 2>/dev/null; or true)
+    end
+
+    # Convert updated_at to relative time
+    set updated_rel $updated_at
+    if test "$updated_at" != "--"
+        set epoch_then (date -d $updated_at +%s 2>/dev/null; or echo 0)
+        set epoch_now (date +%s)
+        set diff (math $epoch_now - $epoch_then)
+        if test $diff -lt 60
+            set updated_rel "$diff""s ago"
+        else if test $diff -lt 3600
+            set updated_rel (math --scale=0 $diff / 60)"m ago"
+        else
+            set updated_rel (math --scale=0 $diff / 3600)"h ago"
+        end
+    end
+
+    printf "Container:  %s\n" $name
+    printf "Worktree:   %s\n" $worktree
+    printf "State:      %s / %s\n" $container_state $agent_state
+    if test -n "$message"
+        printf "Activity:   %s\n" $message
+    end
+    printf "Updated:    %s\n" $updated_rel
+
+    set events_file $CLXD_STATUS_HOST_DIR/$name/events.jsonl
+    if test -f $events_file
+        set recent (tail -5 $events_file 2>/dev/null)
+        if test -n "$recent"
+            echo ""
+            echo "Recent events:"
+            for line in $recent
+                set ts (echo $line | jq -r '.ts // ""' 2>/dev/null)
+                set st (echo $line | jq -r '.state // ""' 2>/dev/null)
+                set msg (echo $line | jq -r '.message // ""' 2>/dev/null)
+                printf "  %-22s  %-8s  %s\n" $ts $st $msg
+            end
+        end
+    end
+end
+
+function _clxd_attach
+    set target ""
+    if test (count $argv) -gt 0
+        set target $argv[1]
+    end
+
+    if test -z "$target"
+        # Default: resolve from $PWD
+        if _clxd_worktree_info $PWD 2>/dev/null
+            set name (_clxd_slug $_wt_path)
+            set slug (string replace 'clxd-' '' $name)
+            _clxd_attach_to_slug $slug
+        else
+            # Not in a worktree — just attach to the session (lands on dash)
+            if set -q TMUX
+                tmux switch-client -t $CLXD_TMUX_SESSION
+            else
+                byobu attach-session -t $CLXD_TMUX_SESSION
+            end
+        end
+        return
+    end
+
+    # Try as a path first
+    if test -d $target
+        if _clxd_worktree_info $target 2>/dev/null
+            set name (_clxd_slug $_wt_path)
+            set slug (string replace 'clxd-' '' $name)
+            _clxd_attach_to_slug $slug
+            return
+        end
+    end
+
+    # Otherwise treat as slug directly
+    _clxd_attach_to_slug $target
+end
+
+function _clxd_ls
+    set containers (lxc list --format csv -c n 2>/dev/null | grep '^clxd-'; or true)
+    for name in (string split \n $containers)
+        test -z "$name"; and continue
+        set worktree (lxc config get $name user.workspace.host-path 2>/dev/null)
+        set slug (lxc config get $name user.workspace.slug 2>/dev/null)
+        set state (lxc info $name 2>/dev/null | awk '/^Status:/ {print tolower($2)}')
+        set agent_state (jq -r '.state // "unknown"' $CLXD_STATUS_HOST_DIR/$name/status.json 2>/dev/null; or echo unknown)
+        echo "$name\t$slug\t$state\t$agent_state\t$worktree"
+    end
+end
+
+function _clxd_stop
+    set path $PWD
+    if test (count $argv) -gt 0
+        set path $argv[1]
+    end
+
+    if not _clxd_worktree_info $path
+        exit 1
+    end
+
+    set name (_clxd_slug $_wt_path)
+
+    if not lxc info $name > /dev/null 2>&1
+        echo "No container found for $path" >&2
+        exit 1
+    end
+
+    echo "Stopping $name..."
+    lxc stop $name
+    echo "Stopped."
+end
+
+function _clxd_destroy
+    set path $PWD
+    if test (count $argv) -gt 0
+        set path $argv[1]
+    end
+
+    if not _clxd_worktree_info $path 2>/dev/null
+        # Path may no longer be a git repo (worktree already removed)
+        # Derive name from the path directly
+        set name (_clxd_slug (realpath $path 2>/dev/null; or echo $path))
+    else
+        set name (_clxd_slug $_wt_path)
+    end
+
+    if not lxc info $name > /dev/null 2>&1
+        echo "No container found: $name" >&2
+        exit 1
+    end
+
+    echo "Destroying $name..."
+    lxc stop --force $name 2>/dev/null; or true
+    lxc delete $name
+    rm -rf $CLXD_STATUS_HOST_DIR/$name
+    echo "Destroyed."
+end
+
+function _clxd_gc
+    set dry_run false
+    for arg in $argv
+        if test "$arg" = --dry-run
+            set dry_run true
+        end
+    end
+
+    set containers (lxc list --format csv -c n 2>/dev/null | grep '^clxd-'; or true)
+    set removed 0
+
+    for name in (string split \n $containers)
+        test -z "$name"; and continue
+
+        set worktree (lxc config get $name user.workspace.host-path 2>/dev/null)
+
+        if test -n "$worktree" -a ! -d "$worktree"
+            if $dry_run
+                echo "[dry-run] Would remove: $name"
+                echo "          worktree gone: $worktree"
+            else
+                echo "Removing orphan: $name (worktree: $worktree)"
+                lxc stop --force $name 2>/dev/null; or true
+                lxc delete $name
+                rm -rf $CLXD_STATUS_HOST_DIR/$name
+                set removed (math $removed + 1)
+            end
+        end
+    end
+
+    if test $removed -gt 0
+        echo "$removed container(s) removed."
+    else if not $dry_run
+        echo "No orphan containers found."
+    end
+end
+
+function _clxd_build_image
+    # Delegate to image/build.fish
+    set build_script $_CLXD_ROOT/image/build.fish
+    if not test -f $build_script
+        echo "Error: build script not found: $build_script" >&2
+        exit 1
+    end
+    fish $build_script $argv
+end
+
+function _clxd_list_images
+    echo "Local claude-in-lxd images:"
+    lxc image list --format table local: | grep claude-in-lxd
+end
+
+function _clxd_help
+    echo "Usage: clxd [<subcommand>] [options]"
+    echo ""
+    echo "  clxd [launch] [--image <alias>] [path]"
+    echo "    Launch Claude agent in an LXD container for the given worktree."
+    echo "    Defaults to \$PWD. Creates the container if needed."
+    echo ""
+    echo "  clxd shell   [path]            Open a bash shell in the container"
+    echo "  clxd exec    [path] -- cmd...  Run a command inside the container"
+    echo "  clxd attach  [path|slug]       Attach to a session's byobu window"
+    echo "  clxd stop    [path]            Stop the container (keep data)"
+    echo "  clxd destroy [path]            Stop + delete the container"
+    echo ""
+    echo "  clxd status  [--json]          One-shot status table"
+    echo "  clxd dash                      Live-updating status dashboard"
+    echo "  clxd ls                        Machine-readable container list"
+    echo ""
+    echo "  clxd gc      [--dry-run]       Remove orphan containers (worktree gone)"
+    echo ""
+    echo "  clxd build-image [profile] [--from dir]"
+    echo "    Build the base image (or a profile layer on top of it)."
+    echo "    Example: clxd build-image zivid --from ~/.config/clxd/profiles/zivid"
+    echo ""
+    echo "  clxd list-images               List local claude-in-lxd* images"
+    echo ""
+    echo "Image selection (in order of precedence):"
+    echo "  1. --image <alias>"
+    echo "  2. .clxd-image file in worktree root"
+    echo "  3. .clxd-image file in main worktree root (inherited by gwt)"
+    echo "  4. Default: claude-in-lxd"
+    echo ""
+    echo "Permission mode: edit CLXD_PERMISSION_MODE in bin/clxd (default: bypassPermissions)"
+    echo "  Values: bypassPermissions, acceptEdits, default"
+end
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+main $argv

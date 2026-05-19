@@ -1,0 +1,34 @@
+#!/bin/bash
+# Fired by Claude Code PreToolUse hook — agent is calling a tool
+set -e
+
+: "${CLXD_STATUS_DIR:=/opt/clxd-status}"
+: "${CLXD_SLUG:=unknown}"
+: "${CLXD_WORKTREE:=unknown}"
+
+mkdir -p "$CLXD_STATUS_DIR"
+
+# Only update if not already "working" to avoid hammering disk
+current_state=$(jq -r '.state // ""' "$CLXD_STATUS_DIR/status.json" 2>/dev/null || true)
+if [ "$current_state" = "working" ]; then
+    exit 0
+fi
+
+# Read tool info from stdin
+input=$(cat)
+tool=$(echo "$input" | jq -r '.tool_name // ""' 2>/dev/null || true)
+
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+tmp="$CLXD_STATUS_DIR/status.json.tmp"
+
+cat > "$tmp" <<EOF
+{
+  "slug": "$CLXD_SLUG",
+  "worktree": "$CLXD_WORKTREE",
+  "state": "working",
+  "message": "$tool",
+  "updated_at": "$ts"
+}
+EOF
+
+mv "$tmp" "$CLXD_STATUS_DIR/status.json"

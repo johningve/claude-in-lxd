@@ -1,0 +1,18 @@
+config:
+  security.nesting: "true"
+  nvidia.runtime: "true"
+  nvidia.driver.capabilities: "compute,utility,graphics,video"
+  raw.idmap: "both 1000 1000"
+description: claude-code agent container with docker + nvidia
+devices:
+  gpu:
+    type: gpu
+    gputype: physical
+  eth0:
+    name: eth0
+    network: lxdbr0
+    type: nic
+  root:
+    path: /
+    pool: default
+    type: disk
