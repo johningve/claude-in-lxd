@@ -1,6 +1,6 @@
 # claude-in-lxd
 
-Run Claude Code (and similar agents) in `--permission-mode bypassPermissions` inside isolated LXD system containers, with full Docker-in-Docker and NVIDIA CUDA support.
+Run Claude Code (and similar agents) in unattended `auto` permission mode inside isolated LXD system containers, with full Docker-in-Docker and NVIDIA CUDA support.
 
 Each git worktree gets its own LXD container. A shared byobu session provides a live dashboard and per-session windows for parallel agents.
 
@@ -176,11 +176,21 @@ Hook scripts write to `/var/run/clxd/` inside the container, which is bind-mount
 
 ## Permission mode
 
-`clxd` launches Claude with `--permission-mode bypassPermissions` by default (fully automated, appropriate for isolated containers). To change this, edit `CLXD_PERMISSION_MODE` near the top of `bin/clxd`:
+`clxd` launches Claude with no explicit `--permission-mode` flag. The behaviour is configured in `image/base/claude-settings.json`, which is seeded into `~/.claude/settings.json` on first boot:
 
-```fish
-set -g CLXD_PERMISSION_MODE acceptEdits   # auto-approve file edits, prompt for shell
+```json
+{
+  "permissions": { "defaultMode": "auto" },
+  "skipAutoPermissionPrompt": true
+}
 ```
+
+- `defaultMode: auto` — Claude's **auto mode** screens each proposed tool call through a separate model that classifies it as safe / needs-confirmation / refuse. Safe calls run without prompting; the rest fall through to a confirmation step.
+- `skipAutoPermissionPrompt: true` — suppresses the human confirmation prompt for the auto-approved cases, leaving the screening model as the sole gate.
+
+Auto mode is **not** the same as `bypassPermissions`. It adds a useful guard against obvious-mistake commands (`rm -rf $HOME`, `git push --force origin master`, exfiltration calls to unfamiliar domains, etc.) before they execute. However, the screening model reads the same conversation context as the main agent, so adversarial content that compromises the agent can plausibly also influence the screener. Treat it as **defence in depth**, not a replacement for the container boundary described in [Security model and known limitations](#security-model-and-known-limitations).
+
+To restore interactive prompts for non-auto-approved calls, delete the `skipAutoPermissionPrompt` line in `image/base/claude-settings.json` and rebuild the image (or edit `~/.claude/settings.json` inside an existing container).
 
 ## Worktree / gwt integration details
 
@@ -211,6 +221,48 @@ clxd gc                                        # remove the now-orphan container
 ```
 
 Or in one step: `clxd destroy` before removing the worktree.
+
+## Security model and known limitations
+
+`clxd` runs an unattended coding agent on real source code. The threat model it is designed for is **trusted repository, untrusted agent**: the code in the worktree is assumed safe to read and execute, but the agent itself may be steered by adversarial inputs (prompt injection from web pages, MCP tool output, package READMEs, error messages from third-party services) or simply make mistakes. The container is the primary boundary that limits the blast radius.
+
+This section documents what the boundary does and does not cover, so callers can make informed decisions before pointing it at sensitive workloads.
+
+### What the container blocks
+
+- **Host root**. The LXD container is unprivileged (`raw.idmap` user-ns, no `--privileged`). `security.nesting=true` enables nested Docker without granting host privilege; the nested daemon is confined to the container's user namespace.
+- **Most of the host filesystem**. The only host paths visible inside the container are: the worktree (rw, same path), the main worktree (**read-only**), `~/.cache/clxd/status/<container>/` (rw, per-container), and optionally `~/.ccache` / `~/.cache/halide-cache` (rw, shared). There is no blanket `$HOME` mount, no `~/.ssh`, no `~/.config/gh`, no `/etc`, no host Docker socket, and no LXD socket.
+- **Cross-worktree contamination**. Each worktree gets its own container with its own filesystem and its own nested Docker daemon. A compromised agent in one container cannot reach another container's worktree, processes, or status files.
+- **SSH / `gh` based git push to arbitrary remotes**. Neither the SSH agent nor the `gh` config is forwarded. HTTPS push would require credentials in `.git/config`, and the main worktree's `.git` is mounted read-only.
+- **Host LXD API**. The `lxc` binary and the LXD UNIX socket are not present inside the container; the agent cannot enumerate, create, or destroy sibling containers.
+
+### Known limitations
+
+The following are intentional trade-offs or known gaps. They are listed so users with stricter threat models can decide whether `clxd` fits, and to mark them for future work.
+
+1. **`raw.idmap: "both 1000 1000"`** maps the host user to the container's `agent` user one-to-one. This is required for bind-mounted worktree files to have correct ownership on both sides. The practical consequence is that within the bind-mounted paths the agent has the host user's effective rights — the protection comes from *which paths are mounted*, not from UID separation.
+2. **Anthropic credentials are pushed into every container.** `~/.claude/.credentials.json` and `~/.claude.json` are copied into the container at mode 600 on every `clxd launch`. A compromised agent can exfiltrate the OAuth token (which is long-lived and shared with the host and every other `clxd` container) and read any MCP server URLs or secrets in `.claude.json`. The token's blast radius extends beyond the container that leaked it.
+3. **`~/.docker/config.json` is forwarded.** Docker registry auth tokens reach the container so that `docker push` works for the user's own registries. A compromised agent can push images to those registries.
+4. **Compilation caches are rw-shared.** When present, `~/.ccache` and `~/.cache/halide-cache` are bind-mounted rw into every container and remain rw on the host. ccache's content-hashed keys make blind poisoning hard, but a hostile agent in one container can in principle arrange to corrupt objects served to a sibling container or to host builds.
+5. **No network egress filtering.** The container has unfiltered Internet access via `lxdbr0`. For the trusted-repo / hostile-agent threat model this is the largest single gap: exfiltrating any data the agent can read (source, ccache, the Anthropic token) requires only an outbound HTTP request. The auto-mode screening LLM provides some protection here, but it is not an authoritative egress filter.
+6. **No resource limits.** The LXD profile sets no `limits.memory`, `limits.cpu`, `limits.processes`, or disk quota. A runaway agent or fork-bomb in a package postinstall script can degrade or OOM the host.
+7. **Auto-mode is the only in-product gate.** `permissions.defaultMode: auto` + `skipAutoPermissionPrompt: true` means a separate screening model is the only check between the agent and the tool runtime. The screener catches obvious-mistake commands but shares conversation context with the main agent, so coordinated prompt-injection can plausibly bypass it. The container boundary is the authoritative gate.
+8. **`agent` has passwordless sudo inside the container.** Necessary for ergonomic use of `apt`, but it means a malicious package postinstall reaches container-root immediately and can persistently modify `/etc/docker/daemon.json`, apt keyrings, etc. Damage stays inside the container, but a long-lived container becomes a stable foothold for subsequent agent runs in the same worktree.
+9. **Read-only main worktree mount is structural, not authoritative.** It blocks direct edits to tracked files and to the canonical `.git/config`, but it does not by itself prevent `git fetch` / `git push` from inside a linked worktree. What prevents pushes today is the absence of forwarded credentials (see #2 and #3 for credentials that *are* forwarded).
+10. **Builder containers use the same profile.** `clxd build-image` launches a builder container with the same `claude-in-lxd` LXD profile, including GPU passthrough, and runs `setup.sh` which downloads packages from the Internet. Build-time supply-chain compromise lands inside the resulting image and is reused by every subsequent `clxd launch`.
+11. **GPU isolation relies on the NVIDIA driver.** `nvidia.runtime=true` injects the host userspace; there is no MIG partitioning or per-container GPU memory quota. Cross-process VRAM isolation depends on the driver.
+
+### Possible hardening
+
+In rough order of value for the stated threat model:
+
+- **Egress allowlist on `lxdbr0`** (or a per-container nftables chain) covering `anthropic.com`, `registry.npmjs.org`, distro mirrors, GitHub API endpoints, and whatever the project's build chain needs. Closes the main exfiltration channel and shrinks the impact of items 2, 3, and 4.
+- **Per-container short-lived OAuth tokens** instead of copying the host `.credentials.json`. Confines the token blast radius to one container's lifetime.
+- **Mount ccache copy-on-write or read-only** with a per-container overlay for writes. Eliminates the cross-container poisoning channel without losing cache hits.
+- **Resource caps on the profile** (`limits.memory`, `limits.cpu`, `limits.processes`) sized to the host.
+- **Conditional Docker config forwarding** — only mount `~/.docker/config.json` when the worktree opts in via `.clxd-image`-style marker, instead of for every container.
+
+These are not on the project's current roadmap; PRs welcome.
 
 ## Known issues
 
