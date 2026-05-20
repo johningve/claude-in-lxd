@@ -69,9 +69,21 @@ end
 
 function cleanup_builder
     set name $argv[1]
-    echo "Cleaning up builder container $name..."
+    echo "Cleaning up builder container $name..." >&2
     lxc stop --force $name 2>/dev/null; or true
     lxc delete $name 2>/dev/null; or true
+end
+
+# Run a command; on failure clean up the builder and abort.
+# Usage: build_step <builder> <description> -- <cmd...>
+function build_step
+    set _builder $argv[1]
+    set _desc $argv[2]
+    $argv[4..]
+    or begin
+        cleanup_builder $_builder
+        die "$_desc failed"
+    end
 end
 
 function push_dir_to_container
@@ -88,13 +100,16 @@ function push_dir_to_container
     set host_base (basename $host_dir)
 
     tar -czf $tmptar -C $host_parent $host_base
+    or return 1
     lxc file push $tmptar $container/tmp/$tmpbase
+    or begin; rm -f $tmptar; return 1; end
     lxc exec $container -- bash -c "
         set -e
         mkdir -p $container_path
         tar -xzf /tmp/$tmpbase -C $container_path --strip-components=1
         rm /tmp/$tmpbase
     "
+    or begin; rm -f $tmptar; return 1; end
     rm -f $tmptar
 end
 
@@ -115,7 +130,8 @@ end
 lxc image delete $base_alias 2>/dev/null; or true
 
 echo "Launching builder: $base_builder (ubuntu:26.04)..."
-lxc launch ubuntu:26.04 $base_builder --profile default --profile claude-in-lxd
+build_step $base_builder "launch base builder" -- \
+    lxc launch ubuntu:26.04 $base_builder --profile default --profile claude-in-lxd
 
 echo "Waiting for container to boot..."
 for i in (seq 1 20)
@@ -126,16 +142,20 @@ for i in (seq 1 20)
 end
 
 echo "Pushing base image files..."
-push_dir_to_container $REPO_DIR/image/base $base_builder /opt/clxd-build
+build_step $base_builder "push base files" -- \
+    push_dir_to_container $REPO_DIR/image/base $base_builder /opt/clxd-build
 
 echo "Running setup.sh (this will take several minutes)..."
-lxc exec $base_builder -- bash /opt/clxd-build/setup.sh
+build_step $base_builder "base setup.sh" -- \
+    lxc exec $base_builder -- bash /opt/clxd-build/setup.sh
 
 echo "Stopping builder..."
-lxc stop $base_builder
+build_step $base_builder "stop base builder" -- \
+    lxc stop $base_builder
 
 echo "Publishing image as '$base_alias'..."
-lxc publish $base_builder --alias $base_alias \
+build_step $base_builder "publish base image" -- \
+    lxc publish $base_builder --alias $base_alias \
     description="claude-in-lxd base (Docker + NVIDIA + claude)"
 
 echo "Removing builder container..."
@@ -165,7 +185,8 @@ end
 lxc image delete $profile_alias 2>/dev/null; or true
 
 echo "Launching profile builder from '$base_alias'..."
-lxc launch $base_alias $profile_builder --profile default --profile claude-in-lxd
+build_step $profile_builder "launch profile builder" -- \
+    lxc launch $base_alias $profile_builder --profile default --profile claude-in-lxd
 
 echo "Waiting for container to boot..."
 for i in (seq 1 20)
@@ -176,16 +197,20 @@ for i in (seq 1 20)
 end
 
 echo "Pushing profile files from $profile_dir..."
-push_dir_to_container $profile_dir $profile_builder /opt/clxd-build
+build_step $profile_builder "push profile files" -- \
+    push_dir_to_container $profile_dir $profile_builder /opt/clxd-build
 
 echo "Running profile setup.sh..."
-lxc exec $profile_builder -- bash /opt/clxd-build/setup.sh
+build_step $profile_builder "profile setup.sh" -- \
+    lxc exec $profile_builder -- bash /opt/clxd-build/setup.sh
 
 echo "Stopping profile builder..."
-lxc stop $profile_builder
+build_step $profile_builder "stop profile builder" -- \
+    lxc stop $profile_builder
 
 echo "Publishing image as '$profile_alias'..."
-lxc publish $profile_builder --alias $profile_alias \
+build_step $profile_builder "publish profile image" -- \
+    lxc publish $profile_builder --alias $profile_alias \
     description="claude-in-lxd + $profile profile"
 
 echo "Removing profile builder container..."
