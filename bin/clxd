@@ -148,9 +148,9 @@ function _clxd_slug
         | tr '[:upper:]' '[:lower:]' \
         | sed 's/[^a-z0-9]/-/g; s/-\+/-/g; s/^-//; s/-$//')
 
-    # LXD max name length is 63. Reserve room for prefix + hash suffix.
+    # LXD max name length is 63. "clxd-"(5) + short(49) + "-"(1) + hash(8) = 63.
     if test (string length $slug) -gt 50
-        set short (string sub -l 50 $slug)
+        set short (string sub -l 49 $slug)
         set hash (echo -n $worktree | sha1sum | cut -c1-8)
         set slug "$short-$hash"
     end
@@ -194,7 +194,7 @@ function _clxd_create_container
     set slug (string replace 'clxd-' '' $name)
 
     echo "Creating container $name from image '$image'..."
-    lxc init $image $name --profile default --profile claude-in-lxd
+    lxc init $image $name --profile default --profile claude-in-lxd; or return 1
 
     # Store metadata for gc and status
     lxc config set $name user.workspace.host-path=$worktree
@@ -431,7 +431,7 @@ function _clxd_launch
 
     # Create container if it doesn't exist
     if not lxc info $name > /dev/null 2>&1
-        _clxd_create_container $name $image $_wt_path $_wt_main
+        _clxd_create_container $name $image $_wt_path $_wt_main; or return 1
         if not lxc start $name
             echo "Error: failed to start container $name" >&2
             echo "Run: lxc info --show-log $name" >&2
@@ -498,7 +498,10 @@ function _clxd_shell
 
     set state (lxc info $name 2>/dev/null | awk '/^Status:/ {print tolower($2)}')
     if test "$state" != running
-        lxc start $name
+        if not lxc start $name
+            echo "Error: failed to start container $name" >&2
+            return 1
+        end
         _clxd_wait_for_boot $name
     end
 
@@ -543,7 +546,10 @@ function _clxd_exec
 
     set state (lxc info $name 2>/dev/null | awk '/^Status:/ {print tolower($2)}')
     if test "$state" != running
-        lxc start $name
+        if not lxc start $name
+            echo "Error: failed to start container $name" >&2
+            return 1
+        end
         _clxd_wait_for_boot $name
     end
 
@@ -945,7 +951,10 @@ function _clxd_stop
     end
 
     echo "Stopping $name..."
-    lxc stop $name
+    if not lxc stop $name
+        echo "Error: failed to stop $name" >&2
+        exit 1
+    end
     echo "Stopped."
 end
 
@@ -970,7 +979,10 @@ function _clxd_destroy
 
     echo "Destroying $name..."
     lxc stop --force $name 2>/dev/null; or true
-    lxc delete $name
+    if not lxc delete $name
+        echo "Error: failed to delete $name" >&2
+        exit 1
+    end
     rm -rf $CLXD_STATUS_HOST_DIR/$name
     echo "Destroyed."
 end
@@ -998,7 +1010,10 @@ function _clxd_gc
             else
                 echo "Removing orphan: $name (worktree: $worktree)"
                 lxc stop --force $name 2>/dev/null; or true
-                lxc delete $name
+                if not lxc delete $name
+                    echo "Error: failed to delete $name — skipping" >&2
+                    continue
+                end
                 rm -rf $CLXD_STATUS_HOST_DIR/$name
                 set removed (math $removed + 1)
             end
@@ -1019,7 +1034,7 @@ function _clxd_build_image
         echo "Error: build script not found: $build_script" >&2
         exit 1
     end
-    fish $build_script $argv
+    fish $build_script $argv; or exit 1
 end
 
 function _clxd_list_images
