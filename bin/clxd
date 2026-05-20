@@ -40,6 +40,16 @@ else
     set -g _HOST_DOCKER_DIR $HOME/.docker
 end
 
+# Resolve host ccache dir (honor CCACHE_DIR)
+if test -n "$CCACHE_DIR"
+    set -g _HOST_CCACHE_DIR $CCACHE_DIR
+else
+    set -g _HOST_CCACHE_DIR $HOME/.ccache
+end
+
+# Resolve host halide-cache dir (no standard env var)
+set -g _HOST_HALIDE_CACHE_DIR $HOME/.cache/halide-cache
+
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
 function main
@@ -203,6 +213,19 @@ function _clxd_create_container
     mkdir -p $CLXD_STATUS_HOST_DIR/$name
     lxc config device add $name clxd-status disk \
         source=$CLXD_STATUS_HOST_DIR/$name path=$CLXD_CONTAINER_STATUS_DIR
+
+    # Bind-mount host compilation caches (rw) when they exist on the host.
+    # Both caches handle concurrent access safely, so sharing across containers
+    # is fine. raw.idmap maps host UID 1000 ↔ container UID 1000 (agent), so
+    # no --uid/--gid flags are needed on the disk devices.
+    if test -d $_HOST_CCACHE_DIR
+        lxc config device add $name ccache disk \
+            source=$_HOST_CCACHE_DIR path=/home/agent/.ccache
+    end
+    if test -d $_HOST_HALIDE_CACHE_DIR
+        lxc config device add $name halide-cache disk \
+            source=$_HOST_HALIDE_CACHE_DIR path=/home/agent/.cache/halide-cache
+    end
 
     # Environment variables available to all processes in the container
     lxc config set $name environment.CLXD_SLUG=$slug
@@ -670,11 +693,10 @@ function _clxd_dash
             --layout=reverse \
             --height 100% \
             --no-info \
-            --header 'Enter=jump/relaunch  r=refresh  q=quit' \
+            --header 'Enter=jump/relaunch  q=quit' \
             --preview "$_CLXD_BIN _dash-preview {1}" \
             --preview-window 'down,30%,wrap' \
-            --bind 'q:abort' \
-            --bind "r:reload($_CLXD_BIN _dash-ls)")
+            --bind 'q:abort')
 
         kill $bg_pid 2>/dev/null
 
@@ -708,9 +730,10 @@ end
 function _clxd_dash_ls
     # One lxc call fetches name + config for all containers at once (avoids per-container API calls)
     set container_rows (lxc list --format json 2>/dev/null | jq -r '
-        .[] | select(.name | startswith("clxd-")) |
+        .[] | select(.name | startswith("clxd-"))
+            | select(.config["user.workspace.slug"]) |
         [.name,
-         (.config["user.workspace.slug"] // ""),
+         .config["user.workspace.slug"],
          (.config["user.workspace.host-path"] // "")] | @tsv
     ' 2>/dev/null)
 

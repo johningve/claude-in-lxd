@@ -96,6 +96,11 @@ fi
 mkdir -p /opt/clxd/hooks
 mkdir -p /opt/clxd-status          # bind-mounted from host; must exist in image
 
+# Pre-create agent's ~/.cache so runtime bind-mounts (e.g. halide-cache) sit
+# under an agent-owned parent, leaving room for other ~/.cache subdirs.
+mkdir -p /home/agent/.cache
+chown 1000:1000 /home/agent/.cache
+
 # Hook scripts and settings were pushed to /opt/clxd-build/ by build.fish
 if [ -d /opt/clxd-build/hooks ]; then
     cp -r /opt/clxd-build/hooks/. /opt/clxd/hooks/

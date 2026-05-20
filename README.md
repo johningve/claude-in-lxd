@@ -191,6 +191,16 @@ The `gwt` function creates worktrees as siblings of the main worktree and symlin
 
 As a result, `git status`, paths in error messages, and compiler output all show the same paths inside and outside the container.
 
+### Compilation caches
+
+When present on the host, two cache directories are bind-mounted into every
+container so builds reuse work across containers and the host:
+
+- `~/.ccache` (or `$CCACHE_DIR` if set) → `/home/agent/.ccache`
+- `~/.cache/halide-cache` → `/home/agent/.cache/halide-cache`
+
+Both are mounted read-write. Mounts are skipped silently if the host directory does not exist.
+
 ## Cleanup
 
 When you're done with a branch:
