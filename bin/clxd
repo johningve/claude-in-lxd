@@ -22,12 +22,6 @@ set -g CLXD_STATUS_HOST_DIR $HOME/.cache/clxd/status
 set -g CLXD_CONTAINER_STATUS_DIR /opt/clxd-status
 set -g CLXD_IMAGE_DEFAULT claude-in-lxd
 set -g CLXD_CONTAINER_CLAUDE_DIR /home/agent/.claude
-# Permission mode for claude inside the container. Valid values:
-#   bypassPermissions  — fully automated (recommended for isolated containers)
-#   acceptEdits        — auto-approve file edits, prompt for shell commands
-#   default            — normal interactive mode
-set -g CLXD_PERMISSION_MODE auto
-
 # Resolve the repo root from the location of this script
 set -g _CLXD_BIN (realpath (status --current-filename))
 set -g _CLXD_ROOT (dirname (dirname $_CLXD_BIN))
@@ -83,6 +77,8 @@ function main
             _clxd_build_image $argv[2..]
         case list-images
             _clxd_list_images
+        case setup-network
+            _clxd_setup_network
         case help --help -h
             _clxd_help
         case '*'
@@ -321,8 +317,9 @@ end
 function _clxd_ensure_tmux_session
     if not tmux has-session -t $CLXD_TMUX_SESSION 2>/dev/null
         # Create session with a pinned 'dash' window showing the status dashboard.
+        # Use byobu new-session so byobu's tmux config is loaded from the start.
         # Use absolute path so tmux's non-interactive shell finds clxd regardless of PATH.
-        tmux new-session -d -s $CLXD_TMUX_SESSION -n dash "$_CLXD_BIN dash"
+        byobu new-session -d -s $CLXD_TMUX_SESSION -n dash "$_CLXD_BIN dash"
         tmux set-option -t $CLXD_TMUX_SESSION:dash remain-on-exit on
         tmux set-hook -t $CLXD_TMUX_SESSION \
             'after-select-window' \
@@ -447,7 +444,7 @@ function _clxd_launch
     _clxd_ensure_tmux_session
 
     # su without -l: preserves container env (CLAUDE_CONFIG_DIR etc.) and avoids setsid
-    set exec_cmd "lxc exec $name --cwd $_wt_path -- su agent -c 'claude --permission-mode $CLXD_PERMISSION_MODE'"
+    set exec_cmd "lxc exec $name --cwd $_wt_path -- su agent -c 'claude'"
 
     # Ensure per-slug agent window in tmux
     _clxd_ensure_agent_window $slug $exec_cmd
@@ -699,7 +696,7 @@ function _clxd_dash
             set _name "clxd-$slug"
             set _wt (lxc config get $_name user.workspace.host-path 2>/dev/null)
             if test -n "$_wt"
-                set _cmd "lxc exec $_name --cwd $_wt -- su agent -c 'claude --permission-mode $CLXD_PERMISSION_MODE'"
+                set _cmd "lxc exec $_name --cwd $_wt -- su agent -c 'claude'"
                 tmux new-window -t $CLXD_TMUX_SESSION: -n $slug $_cmd
                 tmux select-window -t "$CLXD_TMUX_SESSION:$slug" 2>/dev/null
             end
@@ -1007,6 +1004,48 @@ function _clxd_list_images
     lxc image list --format table local: | grep claude-in-lxd
 end
 
+function _clxd_setup_network
+    set domains
+    if command -q resolvectl
+        for line in (resolvectl domain 2>/dev/null)
+            for tok in (string split ' ' (string replace -r '^[^:]+:' '' $line))
+                test -n "$tok"; and test "$tok" != '~.'; and set -a domains $tok
+            end
+        end
+    end
+    if test (count $domains) -eq 0
+        for line in (grep '^search ' /etc/resolv.conf 2>/dev/null)
+            for tok in (string split ' ' (string replace -r '^search +' '' $line))
+                test -n "$tok"; and set -a domains $tok
+            end
+        end
+    end
+
+    if test (count $domains) -eq 0
+        echo "No host search domain detected — nothing to configure."
+        return 0
+    end
+
+    set uniq
+    for d in $domains
+        contains $d $uniq; or set -a uniq $d
+    end
+    set list (string join , $uniq)
+
+    set current (lxc network get lxdbr0 dns.search 2>/dev/null)
+    if test "$current" = "$list"
+        echo "lxdbr0 dns.search already set to '$list' — nothing to do."
+        return 0
+    end
+
+    echo "Setting lxdbr0 dns.search=$list"
+    lxc network set lxdbr0 dns.search $list; or return 1
+
+    echo ""
+    echo "Done. Running containers will not pick up the new search domain until"
+    echo "their next DHCP renewal. To force it: clxd stop <path> && clxd launch <path>"
+end
+
 function _clxd_help
     echo "Usage: clxd [<subcommand>] [options]"
     echo ""
@@ -1030,7 +1069,8 @@ function _clxd_help
     echo "    Build the base image (or a profile layer on top of it)."
     echo "    Example: clxd build-image zivid --from ~/.config/clxd/profiles/zivid"
     echo ""
-    echo "  clxd list-images               List local claude-in-lxd* images"
+    echo "  clxd list-images               List local claude-in-lxd* images
+  clxd setup-network             Propagate host DNS search domain to lxdbr0"
     echo ""
     echo "Image selection (in order of precedence):"
     echo "  1. --image <alias>"
@@ -1038,8 +1078,6 @@ function _clxd_help
     echo "  3. .clxd-image file in main worktree root (inherited by gwt)"
     echo "  4. Default: claude-in-lxd"
     echo ""
-    echo "Permission mode: edit CLXD_PERMISSION_MODE in bin/clxd (default: bypassPermissions)"
-    echo "  Values: bypassPermissions, acceptEdits, default"
 end
 
 # ── Entry point ───────────────────────────────────────────────────────────────

@@ -5,12 +5,12 @@
 #   clxd build-image myprofile --from /path/to/this/dir
 #
 # This script runs INSIDE a container that already has the base image
-# (Docker CE, NVIDIA toolkit, claude CLI, Node.js) installed.
+# (docker.io, nvidia-container-toolkit, claude CLI, Node.js) installed.
 # Add project-specific tooling here.
 #
 # Guidelines:
 #   - Install as root; chown everything you put in /home/agent/ to 1000:1000
-#   - Keep installs idempotent (apt/snap handle this naturally)
+#   - Keep installs idempotent (apt handles this naturally)
 #   - Clean up apt caches at the end to keep the image small
 
 set -euxo pipefail

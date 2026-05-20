@@ -65,6 +65,7 @@ function require_lxc_profile
         lxc profile edit claude-in-lxd < $REPO_DIR/profile.yaml
         echo "Profile created."
     end
+    $REPO_DIR/bin/clxd setup-network
 end
 
 function cleanup_builder

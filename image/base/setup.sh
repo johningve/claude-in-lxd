@@ -1,7 +1,7 @@
 #!/bin/bash
 # Base image setup — runs inside a fresh ubuntu:26.04 LXD container.
-# Installs: user `agent` (UID 1000), Docker, nvidia-container-toolkit,
-# Node.js LTS, claude CLI, common dev tools, and clxd hook scripts.
+# Installs: user `agent` (UID 1000), Docker (apt), nvidia-container-toolkit,
+# claude CLI, common dev tools, and clxd hook scripts.
 
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -37,45 +37,49 @@ apt-get install -y --no-install-recommends \
     bash \
     sudo
 
-# ── Docker snap (bundles engine, CLI, containerd, nvidia-container-toolkit) ────
+# ── Docker engine + buildx + compose (Ubuntu apt repo) ───────────────────────
 
-# Wait for snapd to finish seeding before installing snaps
-snap wait system seed.loaded
+apt-get install -y --no-install-recommends \
+    docker.io \
+    docker-buildx \
+    docker-compose-v2
 
-# The docker snap includes the NVIDIA container runtime — no separate toolkit install needed
-# Create the docker group manually before starting the snap (snap does not create it automatically)
-addgroup --system docker
+# docker.io postinst creates the `docker` group; just add agent to it
 adduser agent docker
 
-snap install docker
-snap start docker
+# ── NVIDIA Container Toolkit (NVIDIA apt repo) ────────────────────────────────
 
-# CRITICAL for unprivileged LXD containers: the outer LXD gpu device already
-# handles cgroup access; the inner nvidia-container-runtime must NOT try to
-# write cgroup device files itself.
-# Try both the system path and common snap-internal paths.
-for config in \
-    /etc/nvidia-container-runtime/config.toml \
-    /var/snap/docker/current/etc/nvidia-container-runtime/config.toml; do
-    if [ -f "$config" ]; then
-        sed -i 's/^#\?\s*no-cgroups\s*=.*/no-cgroups = true/' "$config"
-        grep -q 'no-cgroups' "$config" || echo 'no-cgroups = true' >> "$config"
-    fi
-done
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+    | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+    | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+    > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+apt-get update -q
+apt-get install -y --no-install-recommends nvidia-container-toolkit
+
+# Wire docker to use the nvidia runtime (writes /etc/docker/daemon.json)
+nvidia-ctk runtime configure --runtime=docker
+
+# CRITICAL for unprivileged LXD containers: the outer LXD gpu device handles
+# cgroup access; the inner nvidia-container-runtime must NOT touch cgroups.
+NVIDIA_RT_CONFIG=/etc/nvidia-container-runtime/config.toml
+sed -i 's/^#\?\s*no-cgroups\s*=.*/no-cgroups = true/' "$NVIDIA_RT_CONFIG"
+grep -q '^no-cgroups' "$NVIDIA_RT_CONFIG" || echo 'no-cgroups = true' >> "$NVIDIA_RT_CONFIG"
 
 # Set nvidia as the default Docker runtime so --runtime=nvidia is not required.
-DOCKER_DAEMON_JSON=/var/snap/docker/current/config/daemon.json
-mkdir -p "$(dirname "$DOCKER_DAEMON_JSON")"
+DOCKER_DAEMON_JSON=/etc/docker/daemon.json
 if [ -f "$DOCKER_DAEMON_JSON" ]; then
     jq '. + {"default-runtime": "nvidia"}' "$DOCKER_DAEMON_JSON" > "$DOCKER_DAEMON_JSON.tmp"
     mv "$DOCKER_DAEMON_JSON.tmp" "$DOCKER_DAEMON_JSON"
 else
+    mkdir -p "$(dirname "$DOCKER_DAEMON_JSON")"
     echo '{"default-runtime": "nvidia"}' > "$DOCKER_DAEMON_JSON"
 fi
 
-# ── Node.js LTS (snap) ────────────────────────────────────────────────────────
-
-snap install node --classic
+# Restart so the daemon picks up the new daemon.json (postinst already started it)
+systemctl restart docker
 
 # ── Claude CLI ────────────────────────────────────────────────────────────────
 

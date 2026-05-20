@@ -1,34 +1,22 @@
 {
+  "permissions": {
+    "defaultMode": "auto"
+  },
+  "theme": "auto",
+  "remoteControlAtStartup": true,
+  "skipAutoPermissionPrompt": true,
+  "agentPushNotifEnabled": true,
+  "model": "opusplan",
+  "effortLevel": "max",
   "hooks": {
     "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/opt/clxd/hooks/on-stop"
-          }
-        ]
-      }
+      {"hooks": [{"type": "command", "command": "/opt/clxd/hooks/on-stop"}]}
     ],
     "Notification": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/opt/clxd/hooks/on-notification"
-          }
-        ]
-      }
+      {"hooks": [{"type": "command", "command": "/opt/clxd/hooks/on-notification"}]}
     ],
     "PreToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/opt/clxd/hooks/on-tool-use"
-          }
-        ]
-      }
+      {"hooks": [{"type": "command", "command": "/opt/clxd/hooks/on-tool-use"}]}
     ]
   }
 }
