@@ -39,6 +39,13 @@ else
     set -g _HOST_CLAUDE_DIR $HOME/.claude
 end
 
+# Resolve host docker config dir (honor DOCKER_CONFIG)
+if test -n "$DOCKER_CONFIG"
+    set -g _HOST_DOCKER_DIR $DOCKER_CONFIG
+else
+    set -g _HOST_DOCKER_DIR $HOME/.docker
+end
+
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
 function main
@@ -284,6 +291,19 @@ function _clxd_push_credentials
     end
 end
 
+function _clxd_push_docker_config
+    set name $argv[1]
+    set src $_HOST_DOCKER_DIR/config.json
+    if not test -f $src
+        return 0
+    end
+    lxc exec $name -- bash -c \
+        'mkdir -p /home/agent/.docker && chown 1000:1000 /home/agent/.docker'
+    lxc file push $src \
+        $name/home/agent/.docker/config.json \
+        --uid 1000 --gid 1000 --mode 600
+end
+
 function _clxd_wait_for_docker
     set name $argv[1]
     echo "Waiting for Docker..."
@@ -415,6 +435,7 @@ function _clxd_launch
 
     # Push credentials on every launch (keeps tokens fresh)
     _clxd_push_credentials $name
+    _clxd_push_docker_config $name
 
     # Wait for Docker
     _clxd_wait_for_docker $name
