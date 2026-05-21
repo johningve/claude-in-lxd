@@ -73,6 +73,8 @@ function main
             _clxd_dash_ls
         case _dash-preview
             _clxd_dash_preview $argv[2..]
+        case _notify-daemon
+            _clxd_notify_daemon
         case attach
             _clxd_attach $argv[2..]
         case ls
@@ -668,7 +670,7 @@ function _clxd_notify_daemon
         return
     end
     mkdir -p $CLXD_STATUS_HOST_DIR
-    inotifywait -m -r -e close_write -q --format '%w%f' $CLXD_STATUS_HOST_DIR 2>/dev/null \
+    inotifywait -m -r -e moved_to -q --format '%w%f' $CLXD_STATUS_HOST_DIR 2>/dev/null \
         | while read -l path
         if not string match -q '*/status.json' $path
             continue
@@ -683,9 +685,15 @@ function _clxd_notify_daemon
         switch $state
             case waiting
                 set msg (jq -r '.message // ""' $path 2>/dev/null)
-                notify-send -i dialog-question "Claude waiting" "[$slug] $msg"
+                notify-send -i dialog-question \
+                    -h boolean:transient:true \
+                    -h string:sound-name:message-new-instant \
+                    "Claude waiting" "[$slug] $msg"
             case idle
-                notify-send -i dialog-information "Claude idle" "[$slug]"
+                notify-send -i dialog-information \
+                    -h boolean:transient:true \
+                    -h string:sound-name:message-new-instant \
+                    "Claude idle" "[$slug]"
         end
     end
 end
@@ -703,7 +711,7 @@ function _clxd_dash
 
     set notify_pid ""
     if command -q inotifywait; and command -q notify-send
-        _clxd_notify_daemon &
+        fish $_CLXD_BIN _notify-daemon &
         set notify_pid $last_pid
     end
 

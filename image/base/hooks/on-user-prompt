@@ -1,0 +1,29 @@
+#!/bin/bash
+# Fired by Claude Code UserPromptSubmit hook — user just submitted input.
+# Clears any pending "waiting" state immediately, even before Claude calls
+# its first tool (which may never happen for pure-text turns).
+set -e
+
+: "${CLXD_STATUS_DIR:=/opt/clxd-status}"
+: "${CLXD_SLUG:=unknown}"
+: "${CLXD_WORKTREE:=unknown}"
+
+mkdir -p "$CLXD_STATUS_DIR"
+
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+tmp="$CLXD_STATUS_DIR/status.json.tmp"
+
+cat > "$tmp" <<EOF
+{
+  "slug": "$CLXD_SLUG",
+  "worktree": "$CLXD_WORKTREE",
+  "state": "working",
+  "message": "",
+  "updated_at": "$ts"
+}
+EOF
+
+mv "$tmp" "$CLXD_STATUS_DIR/status.json"
+
+echo "{\"slug\":\"$CLXD_SLUG\",\"state\":\"working\",\"trigger\":\"user_prompt\",\"ts\":\"$ts\"}" \
+  >> "$CLXD_STATUS_DIR/events.jsonl"

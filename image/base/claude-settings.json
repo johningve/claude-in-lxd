@@ -17,6 +17,9 @@
     ],
     "PreToolUse": [
       {"hooks": [{"type": "command", "command": "/opt/clxd/hooks/on-tool-use"}]}
+    ],
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "/opt/clxd/hooks/on-user-prompt"}]}
     ]
   }
 }

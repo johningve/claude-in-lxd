@@ -8,12 +8,6 @@ set -e
 
 mkdir -p "$CLXD_STATUS_DIR"
 
-# Only update if not already "working" to avoid hammering disk
-current_state=$(jq -r '.state // ""' "$CLXD_STATUS_DIR/status.json" 2>/dev/null || true)
-if [ "$current_state" = "working" ]; then
-    exit 0
-fi
-
 # Read tool info from stdin
 input=$(cat)
 tool=$(echo "$input" | jq -r '.tool_name // ""' 2>/dev/null || true)
@@ -21,13 +15,23 @@ tool=$(echo "$input" | jq -r '.tool_name // ""' 2>/dev/null || true)
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 tmp="$CLXD_STATUS_DIR/status.json.tmp"
 
+# Keep updated_at from when the working session started — don't reset the
+# clock on every tool call so the dashboard shows total working duration.
+current_state=$(jq -r '.state // ""' "$CLXD_STATUS_DIR/status.json" 2>/dev/null || true)
+if [ "$current_state" = "working" ]; then
+    updated_at=$(jq -r '.updated_at // ""' "$CLXD_STATUS_DIR/status.json" 2>/dev/null || true)
+    [ -z "$updated_at" ] && updated_at="$ts"
+else
+    updated_at="$ts"
+fi
+
 cat > "$tmp" <<EOF
 {
   "slug": "$CLXD_SLUG",
   "worktree": "$CLXD_WORKTREE",
   "state": "working",
   "message": "$tool",
-  "updated_at": "$ts"
+  "updated_at": "$updated_at"
 }
 EOF
 

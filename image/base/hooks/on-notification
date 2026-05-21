@@ -18,6 +18,15 @@ tmp="$CLXD_STATUS_DIR/status.json.tmp"
 # Escape message for JSON
 message_escaped=$(printf '%s' "$message" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | tr -d '\n')
 
+# Claude Code emits a periodic "Claude is waiting for your input" Notification
+# ~60s after idle. That's a nag, not a real attention request — don't flip the
+# dashboard state. Log it as idle_reminder for traceability and exit.
+if [[ "$message" == *"waiting for your input"* ]]; then
+    echo "{\"slug\":\"$CLXD_SLUG\",\"state\":\"idle_reminder\",\"message\":\"$message_escaped\",\"ts\":\"$ts\"}" \
+      >> "$CLXD_STATUS_DIR/events.jsonl"
+    exit 0
+fi
+
 cat > "$tmp" <<EOF
 {
   "slug": "$CLXD_SLUG",
