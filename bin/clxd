@@ -662,6 +662,34 @@ function _clxd_status
     end
 end
 
+function _clxd_notify_daemon
+    # Watch host status files; fire notify-send on transitions to waiting/idle
+    if not command -q inotifywait; or not command -q notify-send
+        return
+    end
+    mkdir -p $CLXD_STATUS_HOST_DIR
+    inotifywait -m -r -e close_write -q --format '%w%f' $CLXD_STATUS_HOST_DIR 2>/dev/null \
+        | while read -l path
+        if not string match -q '*/status.json' $path
+            continue
+        end
+        set slug (string replace -r '^.*/([^/]+)/status\.json$' '$1' $path)
+        set state (jq -r '.state // ""' $path 2>/dev/null)
+        test -z "$state"; and continue
+        set prev_file "$CLXD_STATUS_HOST_DIR/$slug/.prev_notify_state"
+        set prev (cat $prev_file 2>/dev/null; or echo "")
+        echo $state > $prev_file
+        test "$state" = "$prev"; and continue
+        switch $state
+            case waiting
+                set msg (jq -r '.message // ""' $path 2>/dev/null)
+                notify-send -i dialog-question "Claude waiting" "[$slug] $msg"
+            case idle
+                notify-send -i dialog-information "Claude idle" "[$slug]"
+        end
+    end
+end
+
 function _clxd_dash
     if not command -q fzf
         echo "Note: install fzf for interactive mode (apt install fzf). Falling back to static display."
@@ -671,6 +699,12 @@ function _clxd_dash
             sleep 2
         end
         return
+    end
+
+    set notify_pid ""
+    if command -q inotifywait; and command -q notify-send
+        _clxd_notify_daemon &
+        set notify_pid $last_pid
     end
 
     while true
@@ -699,10 +733,9 @@ function _clxd_dash
             --layout=reverse \
             --height 100% \
             --no-info \
-            --header 'Enter=jump/relaunch  q=quit' \
+            --header 'Enter=jump/relaunch' \
             --preview "$_CLXD_BIN _dash-preview {1}" \
-            --preview-window 'down,30%,wrap' \
-            --bind 'q:abort')
+            --preview-window 'down,30%,wrap')
 
         kill $bg_pid 2>/dev/null
 
@@ -730,6 +763,10 @@ function _clxd_dash
             end
         end
         # Loop: relaunch picker so returning to dash window shows fresh list
+    end
+
+    if test -n "$notify_pid"
+        kill $notify_pid 2>/dev/null
     end
 end
 
