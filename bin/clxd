@@ -14,6 +14,7 @@
 #   clxd gc       [--dry-run]     Remove containers whose worktree is gone
 #   clxd build-image [profile] [--from dir]  Build (or rebuild) an image
 #   clxd list-images              List local claude-in-lxd* images
+#   clxd update-profile           Re-apply profile.yaml to the live LXD profile
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -91,6 +92,8 @@ function main
             _clxd_list_images
         case setup-network
             _clxd_setup_network
+        case update-profile
+            _clxd_update_profile
         case help --help -h
             _clxd_help
         case '*'
@@ -430,6 +433,8 @@ function _clxd_launch
     set image (_clxd_resolve_image "$image" $_wt_path $_wt_main)
     set name (_clxd_slug $_wt_path)
     set slug (string replace 'clxd-' '' $name)
+
+    _clxd_check_profile_freshness
 
     # Create container if it doesn't exist
     if not lxc info $name > /dev/null 2>&1
@@ -1087,6 +1092,48 @@ function _clxd_list_images
     lxc image list --format table local: | grep claude-in-lxd
 end
 
+function _clxd_profile_yaml_hash
+    sha256sum $_CLXD_ROOT/profile.yaml | cut -d' ' -f1
+end
+
+function _clxd_check_profile_freshness
+    set live (lxc profile get claude-in-lxd user.clxd.source-hash 2>/dev/null | string trim)
+    set current (_clxd_profile_yaml_hash)
+    if test -z "$live"
+        echo "warning: live LXD profile 'claude-in-lxd' has no source-hash stamp." >&2
+        echo "         Run 'clxd update-profile' to apply the current profile.yaml." >&2
+    else if test "$live" != "$current"
+        echo "warning: profile.yaml has changed since the live profile was last applied." >&2
+        echo "         Run 'clxd update-profile' to apply, then restart containers to pick it up." >&2
+    end
+end
+
+function _clxd_update_profile
+    if not lxc profile list | grep -q "^| claude-in-lxd "
+        echo "Profile 'claude-in-lxd' does not exist yet. Run 'clxd build-image' to create it." >&2
+        return 1
+    end
+
+    echo "Applying $_CLXD_ROOT/profile.yaml to LXD profile 'claude-in-lxd'..."
+    lxc profile edit claude-in-lxd < $_CLXD_ROOT/profile.yaml; or return 1
+    lxc profile set claude-in-lxd user.clxd.source-hash (_clxd_profile_yaml_hash); or return 1
+    echo "Profile updated."
+
+    set users (lxc list -c name,profiles -f csv 2>/dev/null \
+        | string match -r '^[^,]+,.*claude-in-lxd' \
+        | string replace -r ',.*' '')
+    if test (count $users) -gt 0
+        echo ""
+        echo "Containers using this profile:"
+        for c in $users
+            echo "  - $c"
+        end
+        echo ""
+        echo "Most limits.* keys hot-apply, but a restart guarantees the full profile takes effect:"
+        echo "  for c in $users; lxc restart \$c; end"
+    end
+end
+
 function _clxd_setup_network
     set domains
     if command -q resolvectl
@@ -1153,7 +1200,8 @@ function _clxd_help
     echo "    Example: clxd build-image zivid --from ~/.config/clxd/profiles/zivid"
     echo ""
     echo "  clxd list-images               List local claude-in-lxd* images
-  clxd setup-network             Propagate host DNS search domain to lxdbr0"
+  clxd setup-network             Propagate host DNS search domain to lxdbr0
+  clxd update-profile            Re-apply profile.yaml to the live LXD profile"
     echo ""
     echo "Image selection (in order of precedence):"
     echo "  1. --image <alias>"

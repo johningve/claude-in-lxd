@@ -147,6 +147,7 @@ clxd gc                     # remove containers whose worktree has been rm -rf'd
 clxd gc --dry-run           # preview what gc would remove
 
 clxd list-images            # show available claude-in-lxd* images
+clxd update-profile         # re-apply profile.yaml to the live LXD profile
 ```
 
 ## Authentication
@@ -245,7 +246,7 @@ The following are intentional trade-offs or known gaps. They are listed so users
 3. **`~/.docker/config.json` is forwarded.** Docker registry auth tokens reach the container so that `docker push` works for the user's own registries. A compromised agent can push images to those registries.
 4. **Compilation caches are rw-shared.** When present, `~/.ccache` and `~/.cache/halide-cache` are bind-mounted rw into every container and remain rw on the host. ccache's content-hashed keys make blind poisoning hard, but a hostile agent in one container can in principle arrange to corrupt objects served to a sibling container or to host builds.
 5. **No network egress filtering.** The container has unfiltered Internet access via `lxdbr0`. For the trusted-repo / hostile-agent threat model this is the largest single gap: exfiltrating any data the agent can read (source, ccache, the Anthropic token) requires only an outbound HTTP request. The auto-mode screening LLM provides some protection here, but it is not an authoritative egress filter.
-6. **No resource limits.** The LXD profile sets no `limits.memory`, `limits.cpu`, `limits.processes`, or disk quota. A runaway agent or fork-bomb in a package postinstall script can degrade or OOM the host.
+6. **Resource caps are best-effort.** The profile sets `limits.cpu=16`, `limits.memory=32GiB`, and `limits.processes=4096`. These protect against a single container saturating the host CPU/RAM or fork-bombing, but they do not bound disk I/O, network bandwidth, or nested-Docker daemon memory beyond the cgroup parent. Tune via `lxc config set <name> limits.cpu …` or by editing `profile.yaml` and running `clxd update-profile`.
 7. **Auto-mode is the only in-product gate.** `permissions.defaultMode: auto` + `skipAutoPermissionPrompt: true` means a separate screening model is the only check between the agent and the tool runtime. The screener catches obvious-mistake commands but shares conversation context with the main agent, so coordinated prompt-injection can plausibly bypass it. The container boundary is the authoritative gate.
 8. **`agent` has passwordless sudo inside the container.** Necessary for ergonomic use of `apt`, but it means a malicious package postinstall reaches container-root immediately and can persistently modify `/etc/docker/daemon.json`, apt keyrings, etc. Damage stays inside the container, but a long-lived container becomes a stable foothold for subsequent agent runs in the same worktree.
 9. **Read-only main worktree mount is structural, not authoritative.** It blocks direct edits to tracked files and to the canonical `.git/config`, but it does not by itself prevent `git fetch` / `git push` from inside a linked worktree. What prevents pushes today is the absence of forwarded credentials (see #2 and #3 for credentials that *are* forwarded).
@@ -259,7 +260,6 @@ In rough order of value for the stated threat model:
 - **Egress allowlist on `lxdbr0`** (or a per-container nftables chain) covering `anthropic.com`, `registry.npmjs.org`, distro mirrors, GitHub API endpoints, and whatever the project's build chain needs. Closes the main exfiltration channel and shrinks the impact of items 2, 3, and 4.
 - **Per-container short-lived OAuth tokens** instead of copying the host `.credentials.json`. Confines the token blast radius to one container's lifetime.
 - **Mount ccache copy-on-write or read-only** with a per-container overlay for writes. Eliminates the cross-container poisoning channel without losing cache hits.
-- **Resource caps on the profile** (`limits.memory`, `limits.cpu`, `limits.processes`) sized to the host.
 - **Conditional Docker config forwarding** — only mount `~/.docker/config.json` when the worktree opts in via `.clxd-image`-style marker, instead of for every container.
 
 These are not on the project's current roadmap; PRs welcome.

@@ -3,6 +3,9 @@ config:
   nvidia.runtime: "true"
   nvidia.driver.capabilities: "compute,utility,graphics,video"
   raw.idmap: "both 1000 1000"
+  limits.cpu: "16"
+  limits.memory: "32GiB"
+  limits.processes: "4096"
 description: claude-code agent container with docker + nvidia
 devices:
   gpu:

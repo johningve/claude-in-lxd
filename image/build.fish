@@ -63,6 +63,8 @@ function require_lxc_profile
         echo "LXD profile 'claude-in-lxd' not found. Creating it..."
         lxc profile create claude-in-lxd
         lxc profile edit claude-in-lxd < $REPO_DIR/profile.yaml
+        set hash (sha256sum $REPO_DIR/profile.yaml | cut -d' ' -f1)
+        lxc profile set claude-in-lxd user.clxd.source-hash $hash
         echo "Profile created."
     end
     $REPO_DIR/bin/clxd setup-network
