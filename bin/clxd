@@ -955,6 +955,17 @@ function _clxd_dash
     end
 end
 
+function _clxd_dash_emit_sorted
+    # Emits bucket rows sorted by timestamp (newest first).
+    # Each element in $argv is "<iso-ts>\t<display-line>".
+    if test (count $argv) -eq 0
+        return
+    end
+    for r in (printf '%s\n' $argv | sort -r)
+        string replace -r '^[^\t]*\t' '' $r
+    end
+end
+
 function _clxd_dash_ls
     # One lxc call fetches name + config for all containers at once (avoids per-container API calls)
     set container_rows (lxc list --format json 2>/dev/null | jq -r '
@@ -976,7 +987,14 @@ function _clxd_dash_ls
         return
     end
 
-    # Container rows
+    # Rows bucketed by state for sorted output: waiting > working > idle > other > dead
+    set rows_waiting
+    set rows_working
+    set rows_idle
+    set rows_other
+    set rows_dead
+
+    # Container rows (📦)
     for row in (string split \n $container_rows)
         test -z "$row"; and continue
 
@@ -985,14 +1003,16 @@ function _clxd_dash_ls
         set worktree (printf '%s' $row | cut -f3)
 
         set agent_state unknown
+        set updated_at_raw 0
         set updated_at --
 
         set status_file $CLXD_STATUS_HOST_DIR/$name/status.json
         if test -f $status_file
             set agent_state (jq -r '.state // "unknown"' $status_file 2>/dev/null; or echo unknown)
-            set updated_at (jq -r '.updated_at // "--"' $status_file 2>/dev/null; or echo --)
+            set updated_at_raw (jq -r '.updated_at // "0"' $status_file 2>/dev/null; or echo 0)
+            set updated_at $updated_at_raw
 
-            if test "$updated_at" != "--"
+            if test "$updated_at" != "0"
                 set epoch_then (date -d $updated_at +%s 2>/dev/null; or echo 0)
                 set epoch_now (date +%s)
                 set diff (math $epoch_now - $epoch_then)
@@ -1003,59 +1023,60 @@ function _clxd_dash_ls
                 else
                     set updated_at (math --scale=0 $diff / 3600)"h"
                 end
+            else
+                set updated_at --
             end
         end
 
-        # Override state to "dead" if no active tmux window for this slug
         if not contains $slug $active_windows
             set agent_state dead
         end
 
-        # Color state; compute pad from visual length (not byte length of colored string)
         switch $agent_state
-            case working
-                set state_colored (printf "\e[36m%s\e[0m" $agent_state)
-            case waiting
-                set state_colored (printf "\e[33m%s\e[0m" $agent_state)
-            case idle
-                set state_colored (printf "\e[32m%s\e[0m" $agent_state)
-            case dead
-                set state_colored (printf "\e[31m%s\e[0m" $agent_state)
-            case '*'
-                set state_colored (printf "\e[2m%s\e[0m" $agent_state)
+            case working;  set sc (printf "\e[36m%s\e[0m" $agent_state)
+            case waiting;  set sc (printf "\e[33m%s\e[0m" $agent_state)
+            case idle;     set sc (printf "\e[32m%s\e[0m" $agent_state)
+            case dead;     set sc (printf "\e[31m%s\e[0m" $agent_state)
+            case '*';      set sc (printf "\e[2m%s\e[0m"  $agent_state)
         end
         set pad (string repeat -n (math 9 - (string length $agent_state)) " ")
-
         set display_wt (string replace $HOME '~' $worktree)
         if test (string length $display_wt) -gt 55
-            set _basename (string split '/' $display_wt)[-1]
-            set _pfx_len (math 53 - (string length $_basename))
-            if test $_pfx_len -ge 3
-                set display_wt (string sub -l $_pfx_len $display_wt)…/$_basename
+            set _bn (string split '/' $display_wt)[-1]
+            set _pl (math 53 - (string length $_bn))
+            if test $_pl -ge 3
+                set display_wt (string sub -l $_pl $display_wt)…/$_bn
             else
                 set display_wt ..(string sub -s (math (string length $display_wt) - 52) $display_wt)
             end
         end
-
-        # Tab-separated: field 1 = slug (hidden by --with-nth 2), field 2 = display line
-        printf "%s\t%-57s  %s%s  %s\n" \
-            $slug $display_wt $state_colored $pad $updated_at
+        # Prefix with raw timestamp for within-bucket sort (stripped before output)
+        set line (printf "%s\t%s\t📦 %-57s  %s%s  %s" $updated_at_raw $slug $display_wt $sc $pad $updated_at)
+        switch $agent_state
+            case waiting;  set -a rows_waiting $line
+            case working;  set -a rows_working $line
+            case idle;     set -a rows_idle    $line
+            case dead;     set -a rows_dead    $line
+            case '*';      set -a rows_other   $line
+        end
     end
 
-    # Host session rows
+    # Host session rows (🏠)
     for dir in (find $CLXD_STATUS_HOST_DIR -maxdepth 1 -type d -name 'host-*' 2>/dev/null)
         set slug (basename $dir)
         set worktree ""
         set agent_state unknown
+        set updated_at_raw 0
         set updated_at --
 
         set status_file $dir/status.json
         if test -f $status_file
             set worktree (jq -r '.worktree // ""' $status_file 2>/dev/null; or true)
             set agent_state (jq -r '.state // "unknown"' $status_file 2>/dev/null; or echo unknown)
-            set updated_at (jq -r '.updated_at // "--"' $status_file 2>/dev/null; or echo --)
+            set updated_at_raw (jq -r '.updated_at // "0"' $status_file 2>/dev/null; or echo 0)
+            set updated_at $updated_at_raw
 
-            if test "$updated_at" != "--"
+            if test "$updated_at" != "0"
                 set epoch_then (date -d $updated_at +%s 2>/dev/null; or echo 0)
                 set epoch_now (date +%s)
                 set diff (math $epoch_now - $epoch_then)
@@ -1066,6 +1087,8 @@ function _clxd_dash_ls
                 else
                     set updated_at (math --scale=0 $diff / 3600)"h"
                 end
+            else
+                set updated_at --
             end
         end
 
@@ -1074,33 +1097,40 @@ function _clxd_dash_ls
         end
 
         switch $agent_state
-            case working
-                set state_colored (printf "\e[36m%s\e[0m" $agent_state)
-            case waiting
-                set state_colored (printf "\e[33m%s\e[0m" $agent_state)
-            case idle
-                set state_colored (printf "\e[32m%s\e[0m" $agent_state)
-            case dead
-                set state_colored (printf "\e[31m%s\e[0m" $agent_state)
-            case '*'
-                set state_colored (printf "\e[2m%s\e[0m" $agent_state)
+            case working;  set sc (printf "\e[36m%s\e[0m" $agent_state)
+            case waiting;  set sc (printf "\e[33m%s\e[0m" $agent_state)
+            case idle;     set sc (printf "\e[32m%s\e[0m" $agent_state)
+            case dead;     set sc (printf "\e[31m%s\e[0m" $agent_state)
+            case '*';      set sc (printf "\e[2m%s\e[0m"  $agent_state)
         end
         set pad (string repeat -n (math 9 - (string length $agent_state)) " ")
-
         set display_wt (string replace $HOME '~' $worktree)
         if test (string length $display_wt) -gt 55
-            set _basename (string split '/' $display_wt)[-1]
-            set _pfx_len (math 53 - (string length $_basename))
-            if test $_pfx_len -ge 3
-                set display_wt (string sub -l $_pfx_len $display_wt)…/$_basename
+            set _bn (string split '/' $display_wt)[-1]
+            set _pl (math 53 - (string length $_bn))
+            if test $_pl -ge 3
+                set display_wt (string sub -l $_pl $display_wt)…/$_bn
             else
                 set display_wt ..(string sub -s (math (string length $display_wt) - 52) $display_wt)
             end
         end
-
-        printf "%s\t%-57s  %s%s  %s\n" \
-            $slug $display_wt $state_colored $pad $updated_at
+        set line (printf "%s\t%s\t🏠 %-57s  %s%s  %s" $updated_at_raw $slug $display_wt $sc $pad $updated_at)
+        switch $agent_state
+            case waiting;  set -a rows_waiting $line
+            case working;  set -a rows_working $line
+            case idle;     set -a rows_idle    $line
+            case dead;     set -a rows_dead    $line
+            case '*';      set -a rows_other   $line
+        end
     end
+
+    # Emit in priority order: waiting → working → idle → other → dead
+    # Within each bucket, newest first (timestamp prefix stripped by helper)
+    _clxd_dash_emit_sorted $rows_waiting
+    _clxd_dash_emit_sorted $rows_working
+    _clxd_dash_emit_sorted $rows_idle
+    _clxd_dash_emit_sorted $rows_other
+    _clxd_dash_emit_sorted $rows_dead
 end
 
 function _clxd_dash_preview
