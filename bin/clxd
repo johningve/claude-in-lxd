@@ -2,7 +2,8 @@
 # clxd — LXD-based isolated Claude Code agent runner
 #
 # Subcommands:
-#   clxd [launch] [path]          Launch agent in worktree's container (default)
+#   clxd [launch] [--image <img>] [path]   Launch agent in worktree's container (default)
+#   clxd launch   --host [path]            Launch agent on host (default permission mode)
 #   clxd shell    [path]          Open a bash shell in the container
 #   clxd exec     [path] -- cmd   Run a command inside the container
 #   clxd status   [--json]        One-shot status table of all sessions
@@ -11,7 +12,8 @@
 #   clxd ls                       Machine-readable container list
 #   clxd stop     [path]          Stop container (keep volumes)
 #   clxd destroy  [path]          Stop + delete container
-#   clxd gc       [--dry-run]     Remove containers whose worktree is gone
+#   clxd gc       [--dry-run]     Remove containers/host sessions whose worktree is gone
+#   clxd setup-host               Register hooks in ~/.claude/settings.json (host sessions)
 #   clxd build-image [profile] [--from dir]  Build (or rebuild) an image
 #   clxd list-images              List local claude-in-lxd* images
 #   clxd update-profile           Re-apply profile.yaml to the live LXD profile
@@ -23,6 +25,7 @@ set -g CLXD_STATUS_HOST_DIR $HOME/.cache/clxd/status
 set -g CLXD_CONTAINER_STATUS_DIR /opt/clxd-status
 set -g CLXD_IMAGE_DEFAULT claude-in-lxd
 set -g CLXD_CONTAINER_CLAUDE_DIR /home/agent/.claude
+set -g CLXD_HOOKS_VERSION 1
 # Resolve the repo root from the location of this script
 set -g _CLXD_BIN (realpath (status --current-filename))
 set -g _CLXD_ROOT (dirname (dirname $_CLXD_BIN))
@@ -86,6 +89,8 @@ function main
             _clxd_destroy $argv[2..]
         case gc
             _clxd_gc $argv[2..]
+        case setup-host
+            _clxd_setup_host_hooks
         case build-image
             _clxd_build_image $argv[2..]
         case list-images
@@ -161,6 +166,27 @@ function _clxd_slug
     end
 
     echo "clxd-$slug"
+end
+
+function _clxd_host_slug
+    # Derives a host-session slug from a worktree path: host-<repo>-<branch>
+    set worktree $argv[1]
+    set branch_name (basename $worktree)
+    set repo_name (basename (dirname $worktree))
+
+    set raw "$repo_name-$branch_name"
+    set slug (echo $raw \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed 's/[^a-z0-9]/-/g; s/-\+/-/g; s/^-//; s/-$//')
+
+    # "host-"(5) + short(49) + "-"(1) + hash(8) = 63 chars max
+    if test (string length $slug) -gt 50
+        set short (string sub -l 49 $slug)
+        set hash (echo -n $worktree | sha1sum | cut -c1-8)
+        set slug "$short-$hash"
+    end
+
+    echo "host-$slug"
 end
 
 function _clxd_resolve_image
@@ -365,10 +391,18 @@ end
 function _clxd_ensure_agent_window
     set slug $argv[1]
     set exec_cmd $argv[2]
+    set cwd ""
+    if test (count $argv) -ge 3
+        set cwd $argv[3]
+    end
 
     if not tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_name}' 2>/dev/null \
             | grep -qx $slug
-        tmux new-window -t $CLXD_TMUX_SESSION: -n $slug $exec_cmd
+        if test -n "$cwd"
+            tmux new-window -t $CLXD_TMUX_SESSION: -n $slug -c $cwd $exec_cmd
+        else
+            tmux new-window -t $CLXD_TMUX_SESSION: -n $slug $exec_cmd
+        end
         # Byobu enables automatic-rename globally; lock the name to the slug
         tmux set-window-option -t "$CLXD_TMUX_SESSION:{end}" allow-rename off
     end
@@ -410,9 +444,10 @@ end
 # ── Subcommands ───────────────────────────────────────────────────────────────
 
 function _clxd_launch
-    # Parse: [--image <img>] [path]
+    # Parse: [--image <img>] [--host] [path]
     set image ""
     set path $PWD
+    set host_mode false
 
     set i 1
     while test $i -le (count $argv)
@@ -420,10 +455,17 @@ function _clxd_launch
             case --image
                 set i (math $i + 1)
                 set image $argv[$i]
+            case --host
+                set host_mode true
             case '*'
                 set path $argv[$i]
         end
         set i (math $i + 1)
+    end
+
+    if $host_mode
+        _clxd_launch_host $path
+        return
     end
 
     if not _clxd_worktree_info $path
@@ -484,6 +526,67 @@ function _clxd_launch
     echo "  image:    $image"
 
     _clxd_attach_to_slug $slug
+end
+
+function _clxd_launch_host
+    set path $PWD
+    if test (count $argv) -gt 0
+        set path $argv[1]
+    end
+
+    if not _clxd_worktree_info $path
+        exit 1
+    end
+
+    set slug (_clxd_host_slug $_wt_path)
+    set status_dir $CLXD_STATUS_HOST_DIR/$slug
+
+    # Lazily register hooks in ~/.claude/settings.json on first use
+    _clxd_setup_host_hooks
+
+    # Write initial status
+    _clxd_write_initial_status $slug $slug $_wt_path
+
+    # Ensure tmux session + dash window
+    _clxd_ensure_tmux_session
+
+    set exec_cmd "env CLXD_SLUG=$slug CLXD_WORKTREE=$_wt_path CLXD_STATUS_DIR=$status_dir claude"
+
+    _clxd_ensure_agent_window $slug $exec_cmd $_wt_path
+
+    echo "Host agent launched: $slug"
+    echo "  worktree: $_wt_path"
+    echo "  (default permission mode — tool approvals required)"
+
+    _clxd_attach_to_slug $slug
+end
+
+function _clxd_setup_host_hooks
+    set settings $_HOST_CLAUDE_DIR/settings.json
+    set hooks_dir $_CLXD_ROOT/image/base/hooks
+
+    mkdir -p $_HOST_CLAUDE_DIR
+    if not test -f $settings
+        echo '{}' > $settings
+    end
+
+    set current_version (jq -r '.["clxd.hooks_version"] // 0' $settings 2>/dev/null; or echo 0)
+    if test "$current_version" = "$CLXD_HOOKS_VERSION"
+        return 0
+    end
+
+    echo "Registering clxd hooks in $settings ..."
+    set tmp $settings.clxd-tmp
+    jq --arg d $hooks_dir --argjson v $CLXD_HOOKS_VERSION '
+        .["clxd.hooks_version"] = $v |
+        .hooks = ((.hooks // {}) + {
+            "Stop":             [{"hooks": [{"type": "command", "command": ($d+"/on-stop")}]}],
+            "Notification":     [{"hooks": [{"type": "command", "command": ($d+"/on-notification")}]}],
+            "PreToolUse":       [{"hooks": [{"type": "command", "command": ($d+"/on-tool-use")}]}],
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": ($d+"/on-user-prompt")}]}]
+        })
+    ' $settings > $tmp; and mv $tmp $settings
+    echo "Done. Hook paths: $hooks_dir/on-{stop,notification,tool-use,user-prompt}"
 end
 
 function _clxd_shell
@@ -579,12 +682,13 @@ function _clxd_status
         end
     end
 
-    # Gather all clxd containers
+    # Gather all clxd containers and host session dirs
     set containers (lxc list --format csv -c n 2>/dev/null | grep '^clxd-'; or true)
+    set has_host (find $CLXD_STATUS_HOST_DIR -maxdepth 1 -type d -name 'host-*' 2>/dev/null | head -1)
 
-    if test -z "$containers"
+    if test -z "$containers" -a -z "$has_host"
         if not $json_mode
-            echo "No clxd containers."
+            echo "No clxd sessions."
         end
         return
     end
@@ -597,6 +701,7 @@ function _clxd_status
             (string repeat -n 45 -) -------
     end
 
+    # Container rows
     for name in (string split \n $containers)
         test -z "$name"; and continue
 
@@ -615,7 +720,6 @@ function _clxd_status
             set updated_at (jq -r '.updated_at // "--"' $status_file 2>/dev/null; or echo --)
             set message (jq -r '.message // ""' $status_file 2>/dev/null; or true)
 
-            # Make timestamp human-readable (relative)
             if test "$updated_at" != "--"
                 set epoch_then (date -d $updated_at +%s 2>/dev/null; or echo 0)
                 set epoch_now (date +%s)
@@ -633,7 +737,6 @@ function _clxd_status
         if $json_mode
             echo '{"slug":"'"$slug"'","container":"'"$name"'","container_state":"'"$container_state"'","agent_state":"'"$agent_state"'","worktree":"'"$worktree"'","updated_at":"'"$updated_at"'"}'
         else
-            # Color the state column
             set state_colored $agent_state
             if test "$color_mode" = always
                 switch $agent_state
@@ -659,6 +762,64 @@ function _clxd_status
 
             printf "%-46s  %-9s  %-9s  %-45s  %s\n" \
                 $display_slug $state_colored $container_state $display_wt $updated_at
+        end
+    end
+
+    # Host session rows
+    for dir in (find $CLXD_STATUS_HOST_DIR -maxdepth 1 -type d -name 'host-*' 2>/dev/null)
+        set slug (basename $dir)
+        set worktree ""
+        set agent_state unknown
+        set updated_at --
+
+        set status_file $dir/status.json
+        if test -f $status_file
+            set worktree (jq -r '.worktree // ""' $status_file 2>/dev/null; or true)
+            set agent_state (jq -r '.state // "unknown"' $status_file 2>/dev/null; or echo unknown)
+            set updated_at (jq -r '.updated_at // "--"' $status_file 2>/dev/null; or echo --)
+
+            if test "$updated_at" != "--"
+                set epoch_then (date -d $updated_at +%s 2>/dev/null; or echo 0)
+                set epoch_now (date +%s)
+                set diff (math $epoch_now - $epoch_then)
+                if test $diff -lt 60
+                    set updated_at "$diff""s ago"
+                else if test $diff -lt 3600
+                    set updated_at (math --scale=0 $diff / 60)"m ago"
+                else
+                    set updated_at (math --scale=0 $diff / 3600)"h ago"
+                end
+            end
+        end
+
+        if $json_mode
+            echo '{"slug":"'"$slug"'","container":"host","container_state":"host","agent_state":"'"$agent_state"'","worktree":"'"$worktree"'","updated_at":"'"$updated_at"'"}'
+        else
+            set state_colored $agent_state
+            if test "$color_mode" = always
+                switch $agent_state
+                    case working
+                        set state_colored (printf "\e[36m%s\e[0m" $agent_state)
+                    case waiting
+                        set state_colored (printf "\e[33m%s\e[0m" $agent_state)
+                    case idle
+                        set state_colored (printf "\e[32m%s\e[0m" $agent_state)
+                    case stopped unknown
+                        set state_colored (printf "\e[2m%s\e[0m" $agent_state)
+                end
+            end
+
+            set display_wt (string replace $HOME '~' $worktree)
+            set display_slug $slug
+            if test (string length $display_slug) -gt 44
+                set display_slug (string sub -l 44 $display_slug)..
+            end
+            if test (string length $display_wt) -gt 43
+                set display_wt ..(string sub -s (math (string length $display_wt) - 41) $display_wt)
+            end
+
+            printf "%-46s  %-9s  %-9s  %-45s  %s\n" \
+                $display_slug $state_colored "host" $display_wt $updated_at
         end
     end
 
@@ -766,13 +927,24 @@ function _clxd_dash
             # Live window: jump to it
             tmux select-window -t "$CLXD_TMUX_SESSION:$slug" 2>/dev/null
         else
-            # Dead session: spin up a new window for the same container
-            set _name "clxd-$slug"
-            set _wt (lxc config get $_name user.workspace.host-path 2>/dev/null)
-            if test -n "$_wt"
-                set _cmd "lxc exec $_name --cwd $_wt -- su agent -c 'claude'"
-                tmux new-window -t $CLXD_TMUX_SESSION: -n $slug $_cmd
-                tmux select-window -t "$CLXD_TMUX_SESSION:$slug" 2>/dev/null
+            # Dead session: spin up a new window
+            if string match -q 'host-*' $slug
+                set _status $CLXD_STATUS_HOST_DIR/$slug/status.json
+                set _wt (jq -r '.worktree // ""' $_status 2>/dev/null; or true)
+                if test -n "$_wt"
+                    set _cmd "env CLXD_SLUG=$slug CLXD_WORKTREE=$_wt CLXD_STATUS_DIR=$CLXD_STATUS_HOST_DIR/$slug claude"
+                    tmux new-window -t $CLXD_TMUX_SESSION: -n $slug -c $_wt $_cmd
+                    tmux set-window-option -t "$CLXD_TMUX_SESSION:{end}" allow-rename off
+                    tmux select-window -t "$CLXD_TMUX_SESSION:$slug" 2>/dev/null
+                end
+            else
+                set _name "clxd-$slug"
+                set _wt (lxc config get $_name user.workspace.host-path 2>/dev/null)
+                if test -n "$_wt"
+                    set _cmd "lxc exec $_name --cwd $_wt -- su agent -c 'claude'"
+                    tmux new-window -t $CLXD_TMUX_SESSION: -n $slug $_cmd
+                    tmux select-window -t "$CLXD_TMUX_SESSION:$slug" 2>/dev/null
+                end
             end
         end
         # Loop: relaunch picker so returning to dash window shows fresh list
@@ -793,14 +965,18 @@ function _clxd_dash_ls
          (.config["user.workspace.host-path"] // "")] | @tsv
     ' 2>/dev/null)
 
-    if test -z "$container_rows"
+    # Active tmux window slugs for dead-session detection
+    set active_windows (tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_name}' 2>/dev/null)
+
+    # Check if there are any host sessions
+    set has_host (find $CLXD_STATUS_HOST_DIR -maxdepth 1 -type d -name 'host-*' 2>/dev/null | head -1)
+
+    if test -z "$container_rows" -a -z "$has_host"
         printf "\t(no sessions — run clxd launch in a worktree)\n"
         return
     end
 
-    # Active tmux window slugs for dead-session detection
-    set active_windows (tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_name}' 2>/dev/null)
-
+    # Container rows
     for row in (string split \n $container_rows)
         test -z "$row"; and continue
 
@@ -852,7 +1028,6 @@ function _clxd_dash_ls
 
         set display_wt (string replace $HOME '~' $worktree)
         if test (string length $display_wt) -gt 55
-            # Keep prefix and full last component (branch name): prefix…/branch
             set _basename (string split '/' $display_wt)[-1]
             set _pfx_len (math 53 - (string length $_basename))
             if test $_pfx_len -ge 3
@@ -863,6 +1038,66 @@ function _clxd_dash_ls
         end
 
         # Tab-separated: field 1 = slug (hidden by --with-nth 2), field 2 = display line
+        printf "%s\t%-57s  %s%s  %s\n" \
+            $slug $display_wt $state_colored $pad $updated_at
+    end
+
+    # Host session rows
+    for dir in (find $CLXD_STATUS_HOST_DIR -maxdepth 1 -type d -name 'host-*' 2>/dev/null)
+        set slug (basename $dir)
+        set worktree ""
+        set agent_state unknown
+        set updated_at --
+
+        set status_file $dir/status.json
+        if test -f $status_file
+            set worktree (jq -r '.worktree // ""' $status_file 2>/dev/null; or true)
+            set agent_state (jq -r '.state // "unknown"' $status_file 2>/dev/null; or echo unknown)
+            set updated_at (jq -r '.updated_at // "--"' $status_file 2>/dev/null; or echo --)
+
+            if test "$updated_at" != "--"
+                set epoch_then (date -d $updated_at +%s 2>/dev/null; or echo 0)
+                set epoch_now (date +%s)
+                set diff (math $epoch_now - $epoch_then)
+                if test $diff -lt 60
+                    set updated_at "$diff""s"
+                else if test $diff -lt 3600
+                    set updated_at (math --scale=0 $diff / 60)"m"
+                else
+                    set updated_at (math --scale=0 $diff / 3600)"h"
+                end
+            end
+        end
+
+        if not contains $slug $active_windows
+            set agent_state dead
+        end
+
+        switch $agent_state
+            case working
+                set state_colored (printf "\e[36m%s\e[0m" $agent_state)
+            case waiting
+                set state_colored (printf "\e[33m%s\e[0m" $agent_state)
+            case idle
+                set state_colored (printf "\e[32m%s\e[0m" $agent_state)
+            case dead
+                set state_colored (printf "\e[31m%s\e[0m" $agent_state)
+            case '*'
+                set state_colored (printf "\e[2m%s\e[0m" $agent_state)
+        end
+        set pad (string repeat -n (math 9 - (string length $agent_state)) " ")
+
+        set display_wt (string replace $HOME '~' $worktree)
+        if test (string length $display_wt) -gt 55
+            set _basename (string split '/' $display_wt)[-1]
+            set _pfx_len (math 53 - (string length $_basename))
+            if test $_pfx_len -ge 3
+                set display_wt (string sub -l $_pfx_len $display_wt)…/$_basename
+            else
+                set display_wt ..(string sub -s (math (string length $display_wt) - 52) $display_wt)
+            end
+        end
+
         printf "%s\t%-57s  %s%s  %s\n" \
             $slug $display_wt $state_colored $pad $updated_at
     end
@@ -880,9 +1115,17 @@ function _clxd_dash_preview
         return
     end
 
-    set name "clxd-$slug"
-    set worktree (lxc config get $name user.workspace.host-path 2>/dev/null)
-    set container_state (lxc info $name 2>/dev/null | awk '/^Status:/ {print tolower($2)}')
+    set is_host (string match -q 'host-*' $slug; and echo true; or echo false)
+
+    if $is_host
+        set name $slug
+        set worktree (jq -r '.worktree // ""' $CLXD_STATUS_HOST_DIR/$name/status.json 2>/dev/null; or true)
+        set container_state "host"
+    else
+        set name "clxd-$slug"
+        set worktree (lxc config get $name user.workspace.host-path 2>/dev/null)
+        set container_state (lxc info $name 2>/dev/null | awk '/^Status:/ {print tolower($2)}')
+    end
 
     set agent_state unknown
     set updated_at --
@@ -910,7 +1153,11 @@ function _clxd_dash_preview
         end
     end
 
-    printf "Container:  %s\n" $name
+    if $is_host
+        printf "Session:    %s (host)\n" $name
+    else
+        printf "Container:  %s\n" $name
+    end
     printf "Worktree:   %s\n" $worktree
     printf "State:      %s / %s\n" $container_state $agent_state
     if test -n "$message"
@@ -943,9 +1190,16 @@ function _clxd_attach
     if test -z "$target"
         # Default: resolve from $PWD
         if _clxd_worktree_info $PWD 2>/dev/null
-            set name (_clxd_slug $_wt_path)
-            set slug (string replace 'clxd-' '' $name)
-            _clxd_attach_to_slug $slug
+            set container_slug (string replace 'clxd-' '' (_clxd_slug $_wt_path))
+            set host_slug (_clxd_host_slug $_wt_path)
+            set active_wins (tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_name}' 2>/dev/null)
+            if contains $container_slug $active_wins
+                _clxd_attach_to_slug $container_slug
+            else if contains $host_slug $active_wins
+                _clxd_attach_to_slug $host_slug
+            else
+                _clxd_attach_to_slug $container_slug
+            end
         else
             # Not in a worktree — just attach to the session (lands on dash)
             if set -q TMUX
@@ -960,9 +1214,16 @@ function _clxd_attach
     # Try as a path first
     if test -d $target
         if _clxd_worktree_info $target 2>/dev/null
-            set name (_clxd_slug $_wt_path)
-            set slug (string replace 'clxd-' '' $name)
-            _clxd_attach_to_slug $slug
+            set container_slug (string replace 'clxd-' '' (_clxd_slug $_wt_path))
+            set host_slug (_clxd_host_slug $_wt_path)
+            set active_wins (tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_name}' 2>/dev/null)
+            if contains $container_slug $active_wins
+                _clxd_attach_to_slug $container_slug
+            else if contains $host_slug $active_wins
+                _clxd_attach_to_slug $host_slug
+            else
+                _clxd_attach_to_slug $container_slug
+            end
             return
         end
     end
@@ -980,6 +1241,12 @@ function _clxd_ls
         set state (lxc info $name 2>/dev/null | awk '/^Status:/ {print tolower($2)}')
         set agent_state (jq -r '.state // "unknown"' $CLXD_STATUS_HOST_DIR/$name/status.json 2>/dev/null; or echo unknown)
         echo "$name\t$slug\t$state\t$agent_state\t$worktree"
+    end
+    for dir in (find $CLXD_STATUS_HOST_DIR -maxdepth 1 -type d -name 'host-*' 2>/dev/null)
+        set slug (basename $dir)
+        set worktree (jq -r '.worktree // ""' $dir/status.json 2>/dev/null; or true)
+        set agent_state (jq -r '.state // "unknown"' $dir/status.json 2>/dev/null; or echo unknown)
+        echo "$slug\t$slug\thost\t$agent_state\t$worktree"
     end
 end
 
@@ -1070,10 +1337,27 @@ function _clxd_gc
         end
     end
 
+    # Host sessions: remove status dirs for gone worktrees
+    for dir in (find $CLXD_STATUS_HOST_DIR -maxdepth 1 -type d -name 'host-*' 2>/dev/null)
+        set slug (basename $dir)
+        set worktree (jq -r '.worktree // ""' $dir/status.json 2>/dev/null; or true)
+
+        if test -n "$worktree" -a ! -d "$worktree"
+            if $dry_run
+                echo "[dry-run] Would remove host session: $slug"
+                echo "          worktree gone: $worktree"
+            else
+                echo "Removing orphan host session: $slug (worktree: $worktree)"
+                rm -rf $dir
+                set removed (math $removed + 1)
+            end
+        end
+    end
+
     if test $removed -gt 0
-        echo "$removed container(s) removed."
+        echo "$removed session(s) removed."
     else if not $dry_run
-        echo "No orphan containers found."
+        echo "No orphan sessions found."
     end
 end
 
@@ -1183,17 +1467,26 @@ function _clxd_help
     echo "    Launch Claude agent in an LXD container for the given worktree."
     echo "    Defaults to \$PWD. Creates the container if needed."
     echo ""
+    echo "  clxd launch --host [path]"
+    echo "    Launch Claude agent directly on the host (no container)."
+    echo "    Uses default permission mode — Claude prompts for each tool approval."
+    echo "    Appears on the dashboard and produces the same notifications."
+    echo "    Note: parallel host sessions share ~/.claude state."
+    echo ""
+    echo "  clxd setup-host               Register hooks in ~/.claude/settings.json"
+    echo "    (run automatically by 'launch --host'; re-run to refresh after upgrade)"
+    echo ""
     echo "  clxd shell   [path]            Open a bash shell in the container"
     echo "  clxd exec    [path] -- cmd...  Run a command inside the container"
     echo "  clxd attach  [path|slug]       Attach to a session's byobu window"
     echo "  clxd stop    [path]            Stop the container (keep data)"
     echo "  clxd destroy [path]            Stop + delete the container"
     echo ""
-    echo "  clxd status  [--json]          One-shot status table"
+    echo "  clxd status  [--json]          One-shot status table (containers + host)"
     echo "  clxd dash                      Live-updating status dashboard"
-    echo "  clxd ls                        Machine-readable container list"
+    echo "  clxd ls                        Machine-readable session list"
     echo ""
-    echo "  clxd gc      [--dry-run]       Remove orphan containers (worktree gone)"
+    echo "  clxd gc      [--dry-run]       Remove orphan containers/host sessions"
     echo ""
     echo "  clxd build-image [profile] [--from dir]"
     echo "    Build the base image (or a profile layer on top of it)."

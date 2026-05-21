@@ -2,7 +2,7 @@
 # Fired by Claude Code Notification hook — agent needs user attention
 set -e
 
-: "${CLXD_STATUS_DIR:=/opt/clxd-status}"
+[ -z "$CLXD_STATUS_DIR" ] && exit 0
 : "${CLXD_SLUG:=unknown}"
 : "${CLXD_WORKTREE:=unknown}"
 
