@@ -848,6 +848,9 @@ function _clxd_notify_daemon
         set prev (cat $prev_file 2>/dev/null; or echo "")
         echo $state > $prev_file
         test "$state" = "$prev"; and continue
+        if tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_active}#{window_name}' 2>/dev/null | grep -q "^1$slug\$"
+            continue
+        end
         switch $state
             case waiting
                 set msg (jq -r '.message // ""' $path 2>/dev/null)
