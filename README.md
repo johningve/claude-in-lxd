@@ -1,6 +1,6 @@
-# claude-in-lxd
+# Run claude in LXD
 
-Run Claude Code (and similar agents) in unattended `auto` permission mode inside isolated LXD system containers, with full Docker-in-Docker and NVIDIA CUDA support.
+Run Claude Code in unattended `auto` permission mode inside isolated LXD system containers, with full Docker-in-Docker and NVIDIA CUDA support.
 
 Each git worktree gets its own LXD container. A shared byobu session provides a live dashboard and per-session windows for parallel agents.
 
