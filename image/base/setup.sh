@@ -111,6 +111,10 @@ if [ -f /opt/clxd-build/claude-settings.json ]; then
     cp /opt/clxd-build/claude-settings.json /opt/clxd/claude-settings.json
 fi
 
+if [ -f /opt/clxd-build/CLAUDE.md ]; then
+    cp /opt/clxd-build/CLAUDE.md /opt/clxd/CLAUDE.md
+fi
+
 # The ~/.claude dir is created at first launch (per-container), not baked in.
 # The settings.json template at /opt/clxd/claude-settings.json is seeded into
 # ~/.claude/settings.json by clxd on first boot.

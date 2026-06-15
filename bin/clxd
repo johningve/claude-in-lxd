@@ -292,6 +292,12 @@ function _clxd_first_boot_setup
             chown 1000:1000 /home/agent/.claude/settings.json
         fi
 
+        # Seed base CLAUDE.md instructions if not yet present
+        if [ ! -f /home/agent/.claude/CLAUDE.md ] && [ -f /opt/clxd/CLAUDE.md ]; then
+            cp /opt/clxd/CLAUDE.md /home/agent/.claude/CLAUDE.md
+            chown 1000:1000 /home/agent/.claude/CLAUDE.md
+        fi
+
         touch /var/lib/clxd-initialized
     '
 end
