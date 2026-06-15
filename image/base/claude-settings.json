@@ -9,8 +9,8 @@
   "remoteControlAtStartup": true,
   "skipAutoPermissionPrompt": true,
   "agentPushNotifEnabled": true,
-  "model": "opusplan",
-  "effortLevel": "max",
+  "model": "claude-opus-4-8[1m]",
+  "effortLevel": "xhigh",
   "hooks": {
     "Stop": [
       {"hooks": [{"type": "command", "command": "/opt/clxd/hooks/on-stop"}]}
