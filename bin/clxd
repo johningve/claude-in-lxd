@@ -35,6 +35,13 @@ set -g CLXD_HOOKS_VERSION 1
 set -g _CLXD_BIN (realpath (status --current-filename))
 set -g _CLXD_ROOT (dirname (dirname $_CLXD_BIN))
 
+# Multiplexer abstraction: router + one backend per lib/mux-<name>.fish
+source $_CLXD_ROOT/lib/mux.fish
+for _mux_backend in $_CLXD_ROOT/lib/mux-*.fish
+    source $_mux_backend
+end
+set -g CLXD_MUX (_clxd_detect_mux)
+
 # Resolve host Claude config dir (honor CLAUDE_CONFIG_DIR)
 if test -n "$CLAUDE_CONFIG_DIR"
     set -g _HOST_CLAUDE_DIR $CLAUDE_CONFIG_DIR
@@ -359,59 +366,6 @@ function _clxd_wait_for_docker
     echo "Warning: Docker did not become ready in 30s" >&2
 end
 
-# ── tmux / byobu helpers ──────────────────────────────────────────────────────
-
-function _clxd_ensure_tmux_session
-    if not tmux has-session -t $CLXD_TMUX_SESSION 2>/dev/null
-        # Create session with a pinned 'dash' window showing the status dashboard.
-        # Use byobu new-session so byobu's tmux config is loaded from the start.
-        # Use absolute path so tmux's non-interactive shell finds clxd regardless of PATH.
-        byobu new-session -d -s $CLXD_TMUX_SESSION -n dash "$_CLXD_BIN dash"
-        tmux set-option -t $CLXD_TMUX_SESSION:dash remain-on-exit on
-        tmux set-hook -t $CLXD_TMUX_SESSION \
-            'after-select-window' \
-            "if-shell \"[ #\{window_name\} = dash ]\" \"respawn-window -k\""
-    else
-        # Ensure the dash window still exists
-        if not tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_name}' 2>/dev/null \
-                | grep -qx dash
-            tmux new-window -t $CLXD_TMUX_SESSION: -n dash "$_CLXD_BIN dash"
-            tmux set-option -t $CLXD_TMUX_SESSION:dash remain-on-exit on
-        end
-    end
-end
-
-function _clxd_ensure_agent_window
-    set slug $argv[1]
-    set exec_cmd $argv[2]
-    set cwd ""
-    if test (count $argv) -ge 3
-        set cwd $argv[3]
-    end
-
-    if not tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_name}' 2>/dev/null \
-            | grep -qx $slug
-        if test -n "$cwd"
-            tmux new-window -t $CLXD_TMUX_SESSION: -n $slug -c $cwd $exec_cmd
-        else
-            tmux new-window -t $CLXD_TMUX_SESSION: -n $slug $exec_cmd
-        end
-        # Byobu enables automatic-rename globally; lock the name to the slug
-        tmux set-window-option -t "$CLXD_TMUX_SESSION:{end}" allow-rename off
-    end
-end
-
-function _clxd_attach_to_slug
-    set slug $argv[1]
-    if set -q TMUX
-        echo "Already inside tmux. To switch to this session:"
-        echo "  tmux switch-client -t $CLXD_TMUX_SESSION"
-        echo "  tmux select-window -t '$CLXD_TMUX_SESSION:$slug'"
-    else
-        byobu attach-session -t $CLXD_TMUX_SESSION \; select-window -t $slug
-    end
-end
-
 # ── Write initial status ──────────────────────────────────────────────────────
 
 function _clxd_write_initial_status
@@ -505,20 +459,17 @@ function _clxd_launch
     # Write initial status
     _clxd_write_initial_status $name $slug $_wt_path
 
-    # Ensure tmux session + dash window
-    _clxd_ensure_tmux_session
-
     # su without -l: preserves container env (CLAUDE_CONFIG_DIR etc.) and avoids setsid
     set exec_cmd "lxc exec $name --cwd $_wt_path -- su agent -c 'claude'"
 
-    # Ensure per-slug agent window in tmux
-    _clxd_ensure_agent_window $slug $exec_cmd
+    # Open (or reuse) the agent's session in the multiplexer
+    _clxd_mux open $slug $exec_cmd
 
     echo "Agent launched: $name"
     echo "  worktree: $_wt_path"
     echo "  image:    $image"
 
-    _clxd_attach_to_slug $slug
+    _clxd_mux attach $slug
 end
 
 function _clxd_launch_host
@@ -540,18 +491,15 @@ function _clxd_launch_host
     # Write initial status
     _clxd_write_initial_status $slug $slug $_wt_path
 
-    # Ensure tmux session + dash window
-    _clxd_ensure_tmux_session
-
     set exec_cmd "env CLXD_SLUG=$slug CLXD_WORKTREE=$_wt_path CLXD_STATUS_DIR=$status_dir claude"
 
-    _clxd_ensure_agent_window $slug $exec_cmd $_wt_path
+    _clxd_mux open $slug $exec_cmd $_wt_path
 
     echo "Host agent launched: $slug"
     echo "  worktree: $_wt_path"
     echo "  (default permission mode — tool approvals required)"
 
-    _clxd_attach_to_slug $slug
+    _clxd_mux attach $slug
 end
 
 function _clxd_setup_host_hooks
@@ -918,28 +866,26 @@ function _clxd_dash
             continue
         end
 
-        if tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_name}' 2>/dev/null \
-                | grep -qx $slug
-            # Live window: jump to it
-            tmux select-window -t "$CLXD_TMUX_SESSION:$slug" 2>/dev/null
+        if contains $slug (_clxd_mux list)
+            # Live session: focus it
+            _clxd_mux focus $slug
         else
-            # Dead session: spin up a new window
+            # No live session: (re)launch it, then focus
             if string match -q 'host-*' $slug
                 set _status $CLXD_STATUS_HOST_DIR/$slug/status.json
                 set _wt (jq -r '.worktree // ""' $_status 2>/dev/null; or true)
                 if test -n "$_wt"
                     set _cmd "env CLXD_SLUG=$slug CLXD_WORKTREE=$_wt CLXD_STATUS_DIR=$CLXD_STATUS_HOST_DIR/$slug claude"
-                    tmux new-window -t $CLXD_TMUX_SESSION: -n $slug -c $_wt $_cmd
-                    tmux set-window-option -t "$CLXD_TMUX_SESSION:{end}" allow-rename off
-                    tmux select-window -t "$CLXD_TMUX_SESSION:$slug" 2>/dev/null
+                    _clxd_mux open $slug $_cmd $_wt
+                    _clxd_mux focus $slug
                 end
             else
                 set _name "clxd-$slug"
                 set _wt (lxc config get $_name user.workspace.host-path 2>/dev/null)
                 if test -n "$_wt"
                     set _cmd "lxc exec $_name --cwd $_wt -- su agent -c 'claude'"
-                    tmux new-window -t $CLXD_TMUX_SESSION: -n $slug $_cmd
-                    tmux select-window -t "$CLXD_TMUX_SESSION:$slug" 2>/dev/null
+                    _clxd_mux open $slug $_cmd
+                    _clxd_mux focus $slug
                 end
             end
         end
@@ -972,8 +918,8 @@ function _clxd_dash_ls
          (.config["user.workspace.host-path"] // "")] | @tsv
     ' 2>/dev/null)
 
-    # Active tmux window slugs for dead-session detection
-    set active_windows (tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_name}' 2>/dev/null)
+    # Live session slugs (from the active multiplexer) for dead-session detection
+    set active_windows (_clxd_mux list)
 
     # Check if there are any host sessions
     set has_host (find $CLXD_STATUS_HOST_DIR -maxdepth 1 -type d -name 'host-*' 2>/dev/null | head -1)
@@ -1213,49 +1159,37 @@ function _clxd_attach
         set target $argv[1]
     end
 
+    # No target (use $PWD) or a path target: resolve worktree → prefer live session
+    set resolve_path ""
     if test -z "$target"
-        # Default: resolve from $PWD
-        if _clxd_worktree_info $PWD 2>/dev/null
-            set container_slug (string replace 'clxd-' '' (_clxd_slug $_wt_path))
-            set host_slug (_clxd_host_slug $_wt_path)
-            set active_wins (tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_name}' 2>/dev/null)
-            if contains $container_slug $active_wins
-                _clxd_attach_to_slug $container_slug
-            else if contains $host_slug $active_wins
-                _clxd_attach_to_slug $host_slug
-            else
-                _clxd_attach_to_slug $container_slug
-            end
-        else
-            # Not in a worktree — just attach to the session (lands on dash)
-            if set -q TMUX
-                tmux switch-client -t $CLXD_TMUX_SESSION
-            else
-                byobu attach-session -t $CLXD_TMUX_SESSION
-            end
-        end
-        return
+        set resolve_path $PWD
+    else if test -d $target
+        set resolve_path $target
     end
 
-    # Try as a path first
-    if test -d $target
-        if _clxd_worktree_info $target 2>/dev/null
+    if test -n "$resolve_path"
+        if _clxd_worktree_info $resolve_path 2>/dev/null
             set container_slug (string replace 'clxd-' '' (_clxd_slug $_wt_path))
             set host_slug (_clxd_host_slug $_wt_path)
-            set active_wins (tmux list-windows -t $CLXD_TMUX_SESSION -F '#{window_name}' 2>/dev/null)
-            if contains $container_slug $active_wins
-                _clxd_attach_to_slug $container_slug
-            else if contains $host_slug $active_wins
-                _clxd_attach_to_slug $host_slug
+            set live (_clxd_mux list)
+            if contains $container_slug $live
+                _clxd_mux attach $container_slug
+            else if contains $host_slug $live
+                _clxd_mux attach $host_slug
             else
-                _clxd_attach_to_slug $container_slug
+                _clxd_mux attach $container_slug
             end
+            return
+        end
+        if test -z "$target"
+            # Not in a worktree — just attach to the multiplexer
+            _clxd_mux attach
             return
         end
     end
 
     # Otherwise treat as slug directly
-    _clxd_attach_to_slug $target
+    _clxd_mux attach $target
 end
 
 function _clxd_ls

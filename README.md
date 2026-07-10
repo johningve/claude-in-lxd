@@ -34,10 +34,17 @@ These must be set up once on your host before using `clxd`:
    ```
    If not in the Ubuntu repos, install from NVIDIA's apt repo (see [NVIDIA docs](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)).
 
-4. **byobu + tmux** on the host:
-   ```bash
-   sudo apt-get install -y byobu tmux
-   ```
+4. **A terminal multiplexer backend.** `clxd` hosts each agent in a multiplexer,
+   selected by `_clxd_detect_mux` (override with `CLXD_MUX=tmux|konsole`):
+   - **tmux + byobu** (default, persistent — agents survive detach):
+     ```bash
+     sudo apt-get install -y byobu tmux
+     ```
+   - **konsole** (auto-selected when run from a konsole tab; agents are tabs and
+     do *not* persist — closing a tab kills the agent). Requires enabling
+     konsole's D-Bus control: **Settings → Configure Konsole → General →
+     "Enable the security sensitive parts of the DBus API"**. Without it, tabs
+     open but no command runs.
 
 5. **jq** (used by `clxd status`):
    ```bash
