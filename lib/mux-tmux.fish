@@ -74,6 +74,12 @@ function _clxd_mux_tmux_attach
     end
 end
 
+function _clxd_mux_tmux_name_self
+    # Rename the current window and lock the name against byobu auto-rename.
+    tmux rename-window $argv[1] 2>/dev/null
+    tmux set-window-option allow-rename off 2>/dev/null
+end
+
 function _clxd_mux_tmux_active_slug
     tmux list-windows -t $CLXD_TMUX_SESSION \
         -F '#{window_active}#{window_name}' 2>/dev/null \

@@ -818,6 +818,9 @@ function _clxd_notify_daemon
 end
 
 function _clxd_dash
+    # Title the tab/window this dashboard runs in
+    _clxd_mux name_self dash
+
     if not command -q fzf
         echo "Note: install fzf for interactive mode (apt install fzf). Falling back to static display."
         while true

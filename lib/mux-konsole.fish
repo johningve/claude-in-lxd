@@ -100,8 +100,18 @@ function _clxd_mux_konsole_list
     _clxd_mux_konsole__require_window; or return 1
     for id in (_clxd_mux_konsole__win sessionList)
         set slug (_clxd_mux_konsole__slug_of $id)
-        test -n "$slug"; and echo $slug
+        test -z "$slug"; and continue
+        test "$slug" = dash; and continue   # the dashboard tab itself
+        echo $slug
     end
+end
+
+function _clxd_mux_konsole_name_self
+    # Pin a literal title on the tab clxd is running in (KONSOLE_DBUS_SESSION).
+    _clxd_mux_konsole__require_window; or return 1
+    test -z "$KONSOLE_DBUS_SESSION"; and return 1
+    $_CLXD_QDBUS $KONSOLE_DBUS_SERVICE $KONSOLE_DBUS_SESSION setTabTitleFormat 0 $argv[1] 2>/dev/null
+    $_CLXD_QDBUS $KONSOLE_DBUS_SERVICE $KONSOLE_DBUS_SESSION setTabTitleFormat 1 $argv[1] 2>/dev/null
 end
 
 function _clxd_mux_konsole_attach

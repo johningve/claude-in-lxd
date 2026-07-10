@@ -23,6 +23,9 @@
 #       Print the slug of the currently-focused session (empty if none / n/a).
 #       Used to suppress notifications for the session the user is looking at.
 #
+#   _clxd_mux_<backend>_name_self <title>
+#       Title the session/window clxd is currently running in (used by dash).
+#
 # Add a new backend by dropping in lib/mux-<name>.fish with these five
 # functions and teaching _clxd_detect_mux about it.
 
