@@ -469,7 +469,7 @@ function _clxd_launch
     _clxd_write_initial_status $name $slug $_wt_path
 
     # su without -l: preserves container env (CLAUDE_CONFIG_DIR etc.) and avoids setsid
-    set exec_cmd "lxc exec $name --cwd $_wt_path -- su agent -c 'claude'"
+    set exec_cmd "lxc exec $name --cwd $_wt_path -- su --pty agent -c 'claude'"
 
     # Open (or reuse) the agent's session in the multiplexer
     _clxd_mux open $slug $exec_cmd
@@ -895,7 +895,7 @@ function _clxd_dash
                 set _name "clxd-$slug"
                 set _wt (lxc config get $_name user.workspace.host-path 2>/dev/null)
                 if test -n "$_wt"
-                    set _cmd "lxc exec $_name --cwd $_wt -- su agent -c 'claude'"
+                    set _cmd "lxc exec $_name --cwd $_wt -- su --pty agent -c 'claude'"
                     _clxd_mux open $slug $_cmd
                     _clxd_mux focus $slug
                 end
