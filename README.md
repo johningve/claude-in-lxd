@@ -152,14 +152,15 @@ clxd update-profile         # re-apply profile.yaml to the live LXD profile
 
 ## Authentication
 
-On every `clxd launch`, the tool copies your host Claude credentials into the container:
+On every `clxd launch`, the tool sets a long-lived Claude credential as an environment variable in the container (picked up by `lxc exec`):
 
-- `$CLAUDE_CONFIG_DIR/.credentials.json` → `/home/agent/.claude/.credentials.json`
-- `$CLAUDE_CONFIG_DIR/.claude.json` → `/home/agent/.claude/.claude.json`
+- If `~/.config/clxd/oauth-token` exists on the host (honors `$XDG_CONFIG_HOME`), its contents are forwarded as `CLAUDE_CODE_OAUTH_TOKEN`.
+- Otherwise, `ANTHROPIC_API_KEY` is forwarded from the host env if set.
+- Otherwise, a warning is printed and you can run `claude` interactively inside the container's byobu window to log in.
 
-This mirrors what [`code-on-incus`](https://github.com/mensfeld/code-on-incus) does. Your host login state is reused; each container has its own independent copy (no shared-file races between parallel agents). Credentials are re-synced on each launch, so they stay fresh.
+Generate the long-lived token once on the host with `claude setup-token` and save it to `~/.config/clxd/oauth-token` (a clxd-owned location, kept out of Claude Code's `~/.claude` dir and your host environment).
 
-If no credentials file is found on the host, `ANTHROPIC_API_KEY` is forwarded from the host env if set. Otherwise, a warning is printed and you can run `claude` interactively inside the container's byobu window to log in.
+**Why not copy `.credentials.json`?** That file holds a rotating OAuth refresh token meant to be owned by a single client. Sharing it between the host and one or more containers means whichever side refreshes last invalidates the others, forcing repeated re-authentication (on the host as well as in containers). A dedicated long-lived token sidesteps the rotation race entirely.
 
 The container is configured with `CLAUDE_CONFIG_DIR=/home/agent/.claude` to match this layout.
 
@@ -242,14 +243,14 @@ This section documents what the boundary does and does not cover, so callers can
 The following are intentional trade-offs or known gaps. They are listed so users with stricter threat models can decide whether `clxd` fits, and to mark them for future work.
 
 1. **`raw.idmap: "both 1000 1000"`** maps the host user to the container's `agent` user one-to-one. This is required for bind-mounted worktree files to have correct ownership on both sides. The practical consequence is that within the bind-mounted paths the agent has the host user's effective rights — the protection comes from *which paths are mounted*, not from UID separation.
-2. **Anthropic credentials are pushed into every container.** `~/.claude/.credentials.json` and `~/.claude.json` are copied into the container at mode 600 on every `clxd launch`. A compromised agent can exfiltrate the OAuth token (which is long-lived and shared with the host and every other `clxd` container) and read any MCP server URLs or secrets in `.claude.json`. The token's blast radius extends beyond the container that leaked it.
+2. **A long-lived Anthropic token is forwarded into every container.** The token from `~/.config/clxd/oauth-token` (or `ANTHROPIC_API_KEY`) is set as an environment variable in the container on every `clxd launch`. A compromised agent can exfiltrate this token, and because the same token is shared with every `clxd` container, its blast radius extends beyond the container that leaked it. Revoke it via `claude` / the Anthropic console if leaked. The host's own OAuth credentials (`.credentials.json`, `.claude.json`) are no longer copied in.
 3. **`~/.docker/config.json` is forwarded.** Docker registry auth tokens reach the container so that `docker push` works for the user's own registries. A compromised agent can push images to those registries.
 4. **Compilation caches are rw-shared.** When present, `~/.ccache` and `~/.cache/halide-cache` are bind-mounted rw into every container and remain rw on the host. ccache's content-hashed keys make blind poisoning hard, but a hostile agent in one container can in principle arrange to corrupt objects served to a sibling container or to host builds.
 5. **No network egress filtering.** The container has unfiltered Internet access via `lxdbr0`. For the trusted-repo / hostile-agent threat model this is the largest single gap: exfiltrating any data the agent can read (source, ccache, the Anthropic token) requires only an outbound HTTP request. The auto-mode screening LLM provides some protection here, but it is not an authoritative egress filter.
 6. **Resource caps are best-effort.** The profile sets `limits.cpu=16`, `limits.memory=32GiB`, and `limits.processes=4096`. These protect against a single container saturating the host CPU/RAM or fork-bombing, but they do not bound disk I/O, network bandwidth, or nested-Docker daemon memory beyond the cgroup parent. Tune via `lxc config set <name> limits.cpu …` or by editing `profile.yaml` and running `clxd update-profile`.
 7. **Auto-mode is the only in-product gate.** `permissions.defaultMode: auto` + `skipAutoPermissionPrompt: true` means a separate screening model is the only check between the agent and the tool runtime. The screener catches obvious-mistake commands but shares conversation context with the main agent, so coordinated prompt-injection can plausibly bypass it. The container boundary is the authoritative gate.
 8. **`agent` has passwordless sudo inside the container.** Necessary for ergonomic use of `apt`, but it means a malicious package postinstall reaches container-root immediately and can persistently modify `/etc/docker/daemon.json`, apt keyrings, etc. Damage stays inside the container, but a long-lived container becomes a stable foothold for subsequent agent runs in the same worktree.
-9. **Read-only main worktree mount is structural, not authoritative.** It blocks direct edits to tracked files and to the canonical `.git/config`, but it does not by itself prevent `git fetch` / `git push` from inside a linked worktree. What prevents pushes today is the absence of forwarded credentials (see #2 and #3 for credentials that *are* forwarded).
+9. **Read-only main worktree mount is structural, not authoritative.** It blocks direct edits to tracked files and to the canonical `.git/config`, but it does not by itself prevent `git fetch` / `git push` from inside a linked worktree. What prevents pushes today is the absence of forwarded git credentials (see #2 and #3 for credentials that *are* forwarded).
 10. **Builder containers use the same profile.** `clxd build-image` launches a builder container with the same `claude-in-lxd` LXD profile, including GPU passthrough, and runs `setup.sh` which downloads packages from the Internet. Build-time supply-chain compromise lands inside the resulting image and is reused by every subsequent `clxd launch`.
 11. **GPU isolation relies on the NVIDIA driver.** `nvidia.runtime=true` injects the host userspace; there is no MIG partitioning or per-container GPU memory quota. Cross-process VRAM isolation depends on the driver.
 
@@ -258,7 +259,7 @@ The following are intentional trade-offs or known gaps. They are listed so users
 In rough order of value for the stated threat model:
 
 - **Egress allowlist on `lxdbr0`** (or a per-container nftables chain) covering `anthropic.com`, `registry.npmjs.org`, distro mirrors, GitHub API endpoints, and whatever the project's build chain needs. Closes the main exfiltration channel and shrinks the impact of items 2, 3, and 4.
-- **Per-container short-lived OAuth tokens** instead of copying the host `.credentials.json`. Confines the token blast radius to one container's lifetime.
+- **Per-container short-lived tokens** instead of a single shared long-lived token. Confines the token blast radius to one container's lifetime.
 - **Mount ccache copy-on-write or read-only** with a per-container overlay for writes. Eliminates the cross-container poisoning channel without losing cache hits.
 - **Conditional Docker config forwarding** — only mount `~/.docker/config.json` when the worktree opts in via `.clxd-image`-style marker, instead of for every container.
 
@@ -268,6 +269,6 @@ These are not on the project's current roadmap; PRs welcome.
 
 - **Driver version**: LXD's `nvidia.runtime` hook binds the host's NVIDIA userspace into the container — driver versions automatically stay in sync.
 - **First launch delay**: Docker takes a few seconds to start inside the container after boot. `clxd launch` polls up to 30s.
-- **Parallel token refresh**: each container has its own copy of `.credentials.json`. Concurrent refreshes are independent. If Anthropic rotates the refresh token on use (rare), the second container to refresh may need to re-authenticate. Just run `clxd launch` again to re-push the host credentials.
+- **Token expiry**: the long-lived token from `claude setup-token` does not rotate per use, so parallel containers don't fight over it. It does eventually expire — regenerate it with `claude setup-token` and update `~/.config/clxd/oauth-token`.
 - **byobu nesting**: if you run `clxd` from inside an existing tmux/byobu session, it prints the `select-window` command instead of nesting.
 - **Dash window respawn**: `clxd dash` runs as a persistent window. If it crashes, select the window in byobu and it will restart.

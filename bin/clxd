@@ -22,6 +22,11 @@
 
 set -g CLXD_TMUX_SESSION clxd
 set -g CLXD_STATUS_HOST_DIR $HOME/.cache/clxd/status
+if test -n "$XDG_CONFIG_HOME"
+    set -g CLXD_CONFIG_HOST_DIR $XDG_CONFIG_HOME/clxd
+else
+    set -g CLXD_CONFIG_HOST_DIR $HOME/.config/clxd
+end
 set -g CLXD_CONTAINER_STATUS_DIR /opt/clxd-status
 set -g CLXD_IMAGE_DEFAULT claude-in-lxd
 set -g CLXD_CONTAINER_CLAUDE_DIR /home/agent/.claude
@@ -305,45 +310,27 @@ end
 function _clxd_push_credentials
     set name $argv[1]
 
-    # Ensure target dir exists in container
-    lxc exec $name -- bash -c \
-        "mkdir -p $CLXD_CONTAINER_CLAUDE_DIR && chown 1000:1000 $CLXD_CONTAINER_CLAUDE_DIR"
+    # Authenticate via a dedicated, long-lived credential rather than copying the
+    # host's rotating OAuth credentials (.credentials.json). Sharing that file
+    # between host and container causes refresh-token rotation to invalidate
+    # whichever side didn't refresh last, forcing repeated re-authentication.
+    #
+    # Preferred: a long-lived token from `claude setup-token`, stored in a token
+    # file on the host (kept out of the host environment).
+    # Fallback: ANTHROPIC_API_KEY (Console pay-per-token).
 
-    set pushed false
+    set token_file $CLXD_CONFIG_HOST_DIR/oauth-token
 
-    # Push .credentials.json
-    set creds_src $_HOST_CLAUDE_DIR/.credentials.json
-    if test -f $creds_src
-        lxc file push $creds_src \
-            $name/home/agent/.claude/.credentials.json \
-            --uid 1000 --gid 1000 --mode 600
-        set pushed true
-    end
-
-    # Push .claude.json (inside config dir for this user's layout)
-    set account_src $_HOST_CLAUDE_DIR/.claude.json
-    if test -f $account_src
-        lxc file push $account_src \
-            $name/home/agent/.claude/.claude.json \
-            --uid 1000 --gid 1000 --mode 600
-        set pushed true
-    else if test -f $HOME/.claude.json
-        # Legacy: .claude.json at home root rather than inside config dir
-        lxc file push $HOME/.claude.json \
-            $name/home/agent/.claude/.claude.json \
-            --uid 1000 --gid 1000 --mode 600
-        set pushed true
-    end
-
-    if not $pushed
-        # Try env var fallbacks
-        if test -n "$ANTHROPIC_API_KEY"
-            lxc config set $name environment.ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
-        else
-            echo "Warning: No Claude credentials found on host." >&2
-            echo "  Log in on host first, or set ANTHROPIC_API_KEY." >&2
-            echo "  You can also run 'claude' inside the container to log in interactively." >&2
-        end
+    if test -f $token_file
+        set token (string trim (cat $token_file))
+        lxc config set $name environment.CLAUDE_CODE_OAUTH_TOKEN=$token
+    else if test -n "$ANTHROPIC_API_KEY"
+        lxc config set $name environment.ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
+    else
+        echo "Warning: No Claude credentials found on host." >&2
+        echo "  Run 'claude setup-token' on the host and save the token to:" >&2
+        echo "    $token_file" >&2
+        echo "  Alternatively set ANTHROPIC_API_KEY." >&2
     end
 end
 
@@ -508,7 +495,7 @@ function _clxd_launch
         end
     end
 
-    # Push credentials on every launch (keeps tokens fresh)
+    # Set auth credentials on every launch (idempotent; picked up by lxc exec)
     _clxd_push_credentials $name
     _clxd_push_docker_config $name
 
