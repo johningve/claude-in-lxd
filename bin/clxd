@@ -310,6 +310,15 @@ function _clxd_first_boot_setup
             chown 1000:1000 /home/agent/.claude/CLAUDE.md
         fi
 
+        # Mark onboarding complete so interactive `claude` skips the first-run
+        # login/theme wizard. Auth itself comes from CLAUDE_CODE_OAUTH_TOKEN;
+        # without this key the wizard shows a login screen even with a valid token.
+        if [ ! -f /home/agent/.claude/.claude.json ]; then
+            echo "{\"hasCompletedOnboarding\": true}" > /home/agent/.claude/.claude.json
+            chown 1000:1000 /home/agent/.claude/.claude.json
+            chmod 600 /home/agent/.claude/.claude.json
+        fi
+
         touch /var/lib/clxd-initialized
     '
 end
