@@ -29,6 +29,10 @@ else
 end
 set -g CLXD_CONTAINER_STATUS_DIR /opt/clxd-status
 set -g CLXD_IMAGE_DEFAULT claude-in-lxd
+# Fire notify-send desktop notifications from the dashboard. Set to false to
+# disable — e.g. under konsole, where Claude's terminal bell already produces a
+# clickable, tab-focusing notification.
+set -q CLXD_NOTIFY_SEND; or set -g CLXD_NOTIFY_SEND true
 set -g CLXD_CONTAINER_CLAUDE_DIR /home/agent/.claude
 set -g CLXD_HOOKS_VERSION 1
 # Resolve the repo root from the location of this script
@@ -832,7 +836,7 @@ function _clxd_dash
     end
 
     set notify_pid ""
-    if command -q inotifywait; and command -q notify-send
+    if test "$CLXD_NOTIFY_SEND" = true; and command -q inotifywait; and command -q notify-send
         fish $_CLXD_BIN _notify-daemon &
         set notify_pid $last_pid
     end
