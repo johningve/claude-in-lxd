@@ -89,6 +89,24 @@ function _clxd_mux_konsole_open
     end
 end
 
+function _clxd_mux_konsole_launch_here
+    # Run the agent in the tab clxd was invoked from, rather than a new tab.
+    _clxd_mux_konsole__require_window; or return 1
+    set slug $argv[1]
+    set exec_cmd $argv[2]
+
+    # If a live tab for this slug already exists elsewhere, focus it instead
+    # of clobbering the current tab — preserves the idempotency of `open`.
+    set existing (_clxd_mux_konsole__id_of $slug)
+    if test -n "$existing"
+        _clxd_mux_konsole__win setCurrentSession $existing
+        return 0
+    end
+
+    _clxd_mux_konsole_name_self $slug
+    eval $exec_cmd
+end
+
 function _clxd_mux_konsole_focus
     _clxd_mux_konsole__require_window; or return 1
     set id (_clxd_mux_konsole__id_of $argv[1])

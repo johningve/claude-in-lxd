@@ -45,6 +45,14 @@ function _clxd_mux_tmux_open
     end
 end
 
+function _clxd_mux_tmux_launch_here
+    # tmux has no "current tab" to take over the way konsole does (launch is
+    # normally invoked from outside the managed session), so fall back to the
+    # spawn-a-window-then-attach behaviour.
+    _clxd_mux_tmux_open $argv
+    _clxd_mux_tmux_attach $argv[1]
+end
+
 function _clxd_mux_tmux_focus
     set slug $argv[1]
     tmux select-window -t "$CLXD_TMUX_SESSION:$slug" 2>/dev/null

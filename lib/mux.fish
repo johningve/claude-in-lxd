@@ -10,6 +10,12 @@
 #       Idempotently ensure a session named <slug> exists running <cmd>
 #       (optionally started in <cwd>). No-op if it already exists.
 #
+#   _clxd_mux_<backend>_launch_here <slug> <cmd>
+#       Run <cmd> in the session/tab clxd was invoked from, titling it <slug>,
+#       rather than spawning a fresh one. If a live session named <slug>
+#       already exists, focus that instead of clobbering the current tab.
+#       Used by `clxd launch` so an interactive launch reuses your tab.
+#
 #   _clxd_mux_<backend>_focus  <slug>
 #       Bring the session named <slug> to the foreground within the multiplexer.
 #
