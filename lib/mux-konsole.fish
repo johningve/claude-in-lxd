@@ -1,10 +1,13 @@
 # mux-konsole.fish — konsole backend for the clxd multiplexer abstraction.
 #
-# Each agent is a konsole tab in the *current* window — the one clxd was invoked
-# from. konsole injects the D-Bus coordinates of that window into every session's
-# environment ($KONSOLE_DBUS_SERVICE / $KONSOLE_DBUS_WINDOW), so no discovery is
-# needed. There is NO session persistence: closing a tab kills its agent, so the
-# set of live tabs (sessionList) is authoritative.
+# clxd opens each agent as a konsole tab in the *current* window — the one clxd
+# was invoked from. konsole injects that window's D-Bus coordinates into every
+# session's environment ($KONSOLE_DBUS_SERVICE / $KONSOLE_DBUS_WINDOW), so tab
+# creation needs no discovery. Liveness/lookup, however, sweeps *all* windows of
+# the service (see __all_sessions): a user may move or open a clxd tab in another
+# window, and the dashboard must still see it as alive. There is NO session
+# persistence: closing a tab kills its agent, so the set of live tabs across all
+# windows is authoritative.
 #
 # The slug is stored as the tab's title *format* (a literal with no '%' escapes),
 # which doubles as a pinned display name and a lookup key we set and read back.
@@ -24,6 +27,21 @@ function _clxd_mux_konsole__win
     $_CLXD_QDBUS $KONSOLE_DBUS_SERVICE $KONSOLE_DBUS_WINDOW $argv 2>/dev/null
 end
 
+function _clxd_mux_konsole__windows
+    # All window object paths in the current konsole service. konsole exposes no
+    # windowList method, so we scrape the introspected object tree for /Windows/N.
+    $_CLXD_QDBUS $KONSOLE_DBUS_SERVICE 2>/dev/null | string match -r '^/Windows/[0-9]+$'
+end
+
+function _clxd_mux_konsole__all_sessions
+    # Every session id across every window of the current konsole service.
+    # A clxd tab may live in a different window than the dashboard, so liveness
+    # detection must sweep them all — not just $KONSOLE_DBUS_WINDOW.
+    for win in (_clxd_mux_konsole__windows)
+        $_CLXD_QDBUS $KONSOLE_DBUS_SERVICE $win sessionList 2>/dev/null
+    end
+end
+
 function _clxd_mux_konsole__session
     # Invoke a method on a session object: __session <id> <method> [args...]
     set id $argv[1]
@@ -39,16 +57,24 @@ function _clxd_mux_konsole__slug_of
     end
 end
 
-function _clxd_mux_konsole__id_of
-    # The session id whose slug matches $argv[1], or empty.
+function _clxd_mux_konsole__locate
+    # Locate the tab for slug $argv[1] across all windows.
+    # Echoes the window path and session id on two lines on a match, or nothing.
     set want $argv[1]
-    for id in (_clxd_mux_konsole__win sessionList)
-        set got (_clxd_mux_konsole__slug_of $id)
-        if test "$got" = "$want"
-            echo $id
-            return
+    for win in (_clxd_mux_konsole__windows)
+        for id in ($_CLXD_QDBUS $KONSOLE_DBUS_SERVICE $win sessionList 2>/dev/null)
+            if test (_clxd_mux_konsole__slug_of $id) = "$want"
+                printf '%s\n%s\n' $win $id
+                return
+            end
         end
     end
+end
+
+function _clxd_mux_konsole__id_of
+    # The session id whose slug matches $argv[1], or empty.
+    set found (_clxd_mux_konsole__locate $argv[1])
+    test -n "$found"; and echo $found[2]
 end
 
 function _clxd_mux_konsole_open
@@ -109,14 +135,17 @@ end
 
 function _clxd_mux_konsole_focus
     _clxd_mux_konsole__require_window; or return 1
-    set id (_clxd_mux_konsole__id_of $argv[1])
-    test -z "$id"; and return 1
-    _clxd_mux_konsole__win setCurrentSession $id
+    # Switch to the tab within the window that *owns* it. Calling
+    # setCurrentSession on the wrong window makes konsole yank the tab into that
+    # window instead of switching to it — hence we target the owning window.
+    set found (_clxd_mux_konsole__locate $argv[1])
+    test -z "$found"; and return 1
+    $_CLXD_QDBUS $KONSOLE_DBUS_SERVICE $found[1] setCurrentSession $found[2] 2>/dev/null
 end
 
 function _clxd_mux_konsole_list
     _clxd_mux_konsole__require_window; or return 1
-    for id in (_clxd_mux_konsole__win sessionList)
+    for id in (_clxd_mux_konsole__all_sessions)
         set slug (_clxd_mux_konsole__slug_of $id)
         test -z "$slug"; and continue
         test "$slug" = dash; and continue   # the dashboard tab itself
